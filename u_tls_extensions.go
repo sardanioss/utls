@@ -1222,6 +1222,16 @@ func (e *UtlsCompressCertExtension) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// Same as KeyShareExtension with extra options added without breaking users that
+// use positional struct literal for KeyShareExtension
+type KeyShareExtensionExtended struct {
+	*KeyShareExtension
+
+	// whether to reuse keys for the same algorithm for hybrid key shares with traditional key shares
+	// according to draft-ietf-tls-hybrid-design-14 section 3.2
+	HybridReuseKey bool
+}
+
 // KeyShareExtension implements key_share (51) and is for TLS 1.3 only.
 type KeyShareExtension struct {
 	KeyShares []KeyShare

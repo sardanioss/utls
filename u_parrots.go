@@ -1520,8 +1520,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					},
 				},
 				&SCTExtension{},
-				&KeyShareExtension{
-					KeyShares: []KeyShare{
+				&KeyShareExtensionExtended{
+					KeyShareExtension: &KeyShareExtension{KeyShares: []KeyShare{
 						{
 							Group: X25519MLKEM768,
 						},
@@ -1531,7 +1531,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 						{
 							Group: CurveP256,
 						},
-					},
+					}},
+					HybridReuseKey: true,
 				},
 				&SupportedVersionsExtension{
 					Versions: []uint16{
@@ -2997,52 +2998,12 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 				}
 			}
 		case *KeyShareExtension:
-			preferredCurveIsSet := false
-			for i := range ext.KeyShares {
-				curveID := ext.KeyShares[i].Group
-				if isGREASEUint16(uint16(curveID)) { // just in case the user set a GREASE value instead of unGREASEd
-					ext.KeyShares[i].Group = CurveID(GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_group))
-					continue
-				}
-				if len(ext.KeyShares[i].Data) > 1 {
-					continue
-				}
-
-				if curveID == X25519MLKEM768 || curveID == X25519Kyber768Draft00 {
-					ecdheKey, err := generateECDHEKey(uconn.config.rand(), X25519)
-					if err != nil {
-						return err
-					}
-					seed := make([]byte, mlkem.SeedSize)
-					if _, err := io.ReadFull(uconn.config.rand(), seed); err != nil {
-						return err
-					}
-					mlkemKey, err := mlkem.NewDecapsulationKey768(seed)
-					if err != nil {
-						return err
-					}
-
-					if curveID == X25519Kyber768Draft00 {
-						ext.KeyShares[i].Data = append(ecdheKey.PublicKey().Bytes(), mlkemKey.EncapsulationKey().Bytes()...)
-					} else {
-						ext.KeyShares[i].Data = append(mlkemKey.EncapsulationKey().Bytes(), ecdheKey.PublicKey().Bytes()...)
-					}
-					uconn.HandshakeState.State13.KeyShareKeys.Mlkem = mlkemKey
-					uconn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe = ecdheKey
-				} else {
-					ecdheKey, err := generateECDHEKey(uconn.config.rand(), curveID)
-					if err != nil {
-						return fmt.Errorf("unsupported Curve in KeyShareExtension: %v."+
-							"To mimic it, fill the Data(key) field manually", curveID)
-					}
-
-					ext.KeyShares[i].Data = ecdheKey.PublicKey().Bytes()
-					if !preferredCurveIsSet {
-						// only do this once for the first non-grease curve
-						uconn.HandshakeState.State13.KeyShareKeys.Ecdhe = ecdheKey
-						preferredCurveIsSet = true
-					}
-				}
+			if err := uconn.setKeyShare(&KeyShareExtensionExtended{KeyShareExtension: ext}); err != nil {
+				return err
+			}
+		case *KeyShareExtensionExtended:
+			if err := uconn.setKeyShare(ext); err != nil {
+				return err
 			}
 		case *SupportedVersionsExtension:
 			for i := range ext.Versions {
@@ -3362,4 +3323,62 @@ func removeRC4Ciphers(s []uint16) []uint16 {
 		}
 	}
 	return s[:sliceLen]
+}
+
+func (uconn *UConn) setKeyShare(ext *KeyShareExtensionExtended) error {
+	preferredCurveIsSet := false
+	for i := range ext.KeyShares {
+		curveID := ext.KeyShares[i].Group
+		if isGREASEUint16(uint16(curveID)) { // just in case the user set a GREASE value instead of unGREASEd
+			ext.KeyShares[i].Group = CurveID(GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_group))
+			continue
+		}
+		if len(ext.KeyShares[i].Data) > 1 {
+			continue
+		}
+
+		if curveID == X25519MLKEM768 || curveID == X25519Kyber768Draft00 {
+			ecdheKey, err := generateECDHEKey(uconn.config.rand(), X25519)
+			if err != nil {
+				return err
+			}
+			seed := make([]byte, mlkem.SeedSize)
+			if _, err := io.ReadFull(uconn.config.rand(), seed); err != nil {
+				return err
+			}
+			mlkemKey, err := mlkem.NewDecapsulationKey768(seed)
+			if err != nil {
+				return err
+			}
+
+			if curveID == X25519Kyber768Draft00 {
+				ext.KeyShares[i].Data = append(ecdheKey.PublicKey().Bytes(), mlkemKey.EncapsulationKey().Bytes()...)
+			} else {
+				ext.KeyShares[i].Data = append(mlkemKey.EncapsulationKey().Bytes(), ecdheKey.PublicKey().Bytes()...)
+			}
+			uconn.HandshakeState.State13.KeyShareKeys.Mlkem = mlkemKey
+			uconn.HandshakeState.State13.KeyShareKeys.MlkemEcdhe = ecdheKey
+
+			if ext.HybridReuseKey && len(ext.KeyShares) > i+1 && ext.KeyShares[i+1].Group == X25519 {
+				preferredCurveIsSet = true
+				uconn.HandshakeState.State13.KeyShareKeys.Ecdhe = ecdheKey
+				ext.KeyShares[i+1].Data = ecdheKey.PublicKey().Bytes()
+			}
+		} else {
+			ecdheKey, err := generateECDHEKey(uconn.config.rand(), curveID)
+			if err != nil {
+				return fmt.Errorf("unsupported Curve in KeyShareExtension: %v."+
+					"To mimic it, fill the Data(key) field manually", curveID)
+			}
+
+			ext.KeyShares[i].Data = ecdheKey.PublicKey().Bytes()
+			if !preferredCurveIsSet {
+				// only do this once for the first non-grease curve
+				uconn.HandshakeState.State13.KeyShareKeys.Ecdhe = ecdheKey
+				preferredCurveIsSet = true
+			}
+		}
+	}
+
+	return nil
 }
