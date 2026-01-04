@@ -18,7 +18,7 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/refraction-networking/utls/dicttls"
+	"github.com/sardanioss/utls/dicttls"
 )
 
 var ErrUnknownClientHelloID = errors.New("tls: unknown ClientHelloID")
@@ -979,38 +979,30 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Fixed extension order for Windows - NO SHUFFLE
-			// Order: GREASE, 65281, 35, 65037, 27, 10, 5, 11, 45, 18, 43, 17613, 0, 13, 51, 16, 23, GREASE
+			// Fixed extension order for Chrome - matches real production Chrome
+			// Order: GREASE, compress_cert, ALPN, renegotiation, status_request, app_settings,
+			//        SNI, SCT, supported_versions, ECH, ec_point_formats, sig_algs,
+			//        psk_modes, session_ticket, extended_master_secret, supported_groups, key_share, GREASE
 			Extensions: []TLSExtension{
 				&UtlsGREASEExtension{},
-				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
-				&SessionTicketExtension{},
-				BoringGREASEECH(),
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
 				}},
-				&SupportedCurvesExtension{[]CurveID{
-					GREASE_PLACEHOLDER,
-					X25519MLKEM768,
-					X25519,
-					CurveP256,
-					CurveP384,
-				}},
+				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
+				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
 				&StatusRequestExtension{},
-				&SupportedPointsExtension{SupportedPoints: []byte{
-					0x00, // pointFormatUncompressed
-				}},
-				&PSKKeyExchangeModesExtension{[]uint8{
-					PskModeDHE,
-				}},
+				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}},
+				&SNIExtension{},
 				&SCTExtension{},
 				&SupportedVersionsExtension{[]uint16{
 					GREASE_PLACEHOLDER,
 					VersionTLS13,
 					VersionTLS12,
 				}},
-				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}},
-				&SNIExtension{},
+				BoringGREASEECH(),
+				&SupportedPointsExtension{SupportedPoints: []byte{
+					0x00, // pointFormatUncompressed
+				}},
 				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
 					ECDSAWithP256AndSHA256,
 					PSSWithSHA256,
@@ -1021,18 +1013,27 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					PSSWithSHA512,
 					PKCS1WithSHA512,
 				}},
+				&PSKKeyExchangeModesExtension{[]uint8{
+					PskModeDHE,
+				}},
+				&SessionTicketExtension{},
+				&ExtendedMasterSecretExtension{},
+				&SupportedCurvesExtension{[]CurveID{
+					GREASE_PLACEHOLDER,
+					X25519MLKEM768,
+					X25519,
+					CurveP256,
+					CurveP384,
+				}},
 				&KeyShareExtension{[]KeyShare{
 					{Group: CurveID(GREASE_PLACEHOLDER), Data: []byte{0}},
 					{Group: X25519MLKEM768},
 					{Group: X25519},
 				}},
-				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
-				&ExtendedMasterSecretExtension{},
 				&UtlsGREASEExtension{},
 			},
 		}, nil
-	// Chrome 143 Linux - Fixed extension order matching real Chrome on Linux
-	// TODO: Update with real Linux capture when available
+	// Chrome 143 Linux - Fixed extension order matching real Chrome production
 	case HelloChrome_143_Linux:
 		return ClientHelloSpec{
 			CipherSuites: []uint16{
@@ -1056,37 +1057,27 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Using Windows order as placeholder until Linux capture available
+			// Fixed extension order for Chrome - matches real production Chrome
 			Extensions: []TLSExtension{
 				&UtlsGREASEExtension{},
-				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
-				&SessionTicketExtension{},
-				BoringGREASEECH(),
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
 				}},
-				&SupportedCurvesExtension{[]CurveID{
-					GREASE_PLACEHOLDER,
-					X25519MLKEM768,
-					X25519,
-					CurveP256,
-					CurveP384,
-				}},
+				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
+				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
 				&StatusRequestExtension{},
-				&SupportedPointsExtension{SupportedPoints: []byte{
-					0x00, // pointFormatUncompressed
-				}},
-				&PSKKeyExchangeModesExtension{[]uint8{
-					PskModeDHE,
-				}},
+				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}},
+				&SNIExtension{},
 				&SCTExtension{},
 				&SupportedVersionsExtension{[]uint16{
 					GREASE_PLACEHOLDER,
 					VersionTLS13,
 					VersionTLS12,
 				}},
-				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}},
-				&SNIExtension{},
+				BoringGREASEECH(),
+				&SupportedPointsExtension{SupportedPoints: []byte{
+					0x00, // pointFormatUncompressed
+				}},
 				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
 					ECDSAWithP256AndSHA256,
 					PSSWithSHA256,
@@ -1097,18 +1088,27 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					PSSWithSHA512,
 					PKCS1WithSHA512,
 				}},
+				&PSKKeyExchangeModesExtension{[]uint8{
+					PskModeDHE,
+				}},
+				&SessionTicketExtension{},
+				&ExtendedMasterSecretExtension{},
+				&SupportedCurvesExtension{[]CurveID{
+					GREASE_PLACEHOLDER,
+					X25519MLKEM768,
+					X25519,
+					CurveP256,
+					CurveP384,
+				}},
 				&KeyShareExtension{[]KeyShare{
 					{Group: CurveID(GREASE_PLACEHOLDER), Data: []byte{0}},
 					{Group: X25519MLKEM768},
 					{Group: X25519},
 				}},
-				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
-				&ExtendedMasterSecretExtension{},
 				&UtlsGREASEExtension{},
 			},
 		}, nil
-	// Chrome 143 macOS - Fixed extension order matching real Chrome on macOS
-	// TODO: Update with real macOS capture when available
+	// Chrome 143 macOS - Fixed extension order matching real Chrome production
 	case HelloChrome_143_macOS:
 		return ClientHelloSpec{
 			CipherSuites: []uint16{
@@ -1132,37 +1132,27 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Using Windows order as placeholder until macOS capture available
+			// Fixed extension order for Chrome - matches real production Chrome
 			Extensions: []TLSExtension{
 				&UtlsGREASEExtension{},
-				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
-				&SessionTicketExtension{},
-				BoringGREASEECH(),
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
 				}},
-				&SupportedCurvesExtension{[]CurveID{
-					GREASE_PLACEHOLDER,
-					X25519MLKEM768,
-					X25519,
-					CurveP256,
-					CurveP384,
-				}},
+				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
+				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
 				&StatusRequestExtension{},
-				&SupportedPointsExtension{SupportedPoints: []byte{
-					0x00, // pointFormatUncompressed
-				}},
-				&PSKKeyExchangeModesExtension{[]uint8{
-					PskModeDHE,
-				}},
+				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}},
+				&SNIExtension{},
 				&SCTExtension{},
 				&SupportedVersionsExtension{[]uint16{
 					GREASE_PLACEHOLDER,
 					VersionTLS13,
 					VersionTLS12,
 				}},
-				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h2"}},
-				&SNIExtension{},
+				BoringGREASEECH(),
+				&SupportedPointsExtension{SupportedPoints: []byte{
+					0x00, // pointFormatUncompressed
+				}},
 				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
 					ECDSAWithP256AndSHA256,
 					PSSWithSHA256,
@@ -1173,13 +1163,23 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					PSSWithSHA512,
 					PKCS1WithSHA512,
 				}},
+				&PSKKeyExchangeModesExtension{[]uint8{
+					PskModeDHE,
+				}},
+				&SessionTicketExtension{},
+				&ExtendedMasterSecretExtension{},
+				&SupportedCurvesExtension{[]CurveID{
+					GREASE_PLACEHOLDER,
+					X25519MLKEM768,
+					X25519,
+					CurveP256,
+					CurveP384,
+				}},
 				&KeyShareExtension{[]KeyShare{
 					{Group: CurveID(GREASE_PLACEHOLDER), Data: []byte{0}},
 					{Group: X25519MLKEM768},
 					{Group: X25519},
 				}},
-				&ALPNExtension{AlpnProtocols: []string{"h2", "http/1.1"}},
-				&ExtendedMasterSecretExtension{},
 				&UtlsGREASEExtension{},
 			},
 		}, nil
