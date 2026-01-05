@@ -654,6 +654,14 @@ var (
 	// Uses different TLS extensions compared to TCP (no legacy TLS 1.2 extensions)
 	HelloChrome_143_QUIC = ClientHelloID{helloChrome, "143_QUIC", nil, nil}
 
+	// Chrome w/ PSK: Chrome sends this ClientHello after doing TLS 1.3 handshake with the same server.
+	// These include the pre_shared_key extension for session resumption.
+	HelloChrome_133_PSK         = ClientHelloID{helloChrome, "133_PSK", nil, nil}
+	HelloChrome_143_Windows_PSK = ClientHelloID{helloChrome, "143_Windows_PSK", nil, nil}
+	HelloChrome_143_Linux_PSK   = ClientHelloID{helloChrome, "143_Linux_PSK", nil, nil}
+	HelloChrome_143_macOS_PSK   = ClientHelloID{helloChrome, "143_macOS_PSK", nil, nil}
+	HelloChrome_143_QUIC_PSK    = ClientHelloID{helloChrome, "143_QUIC_PSK", nil, nil}
+
 	HelloIOS_Auto = HelloIOS_14
 	HelloIOS_11_1 = ClientHelloID{helloIOS, "111", nil, nil} // legacy "111" means 11.1
 	HelloIOS_12_1 = ClientHelloID{helloIOS, "12.1", nil, nil}
