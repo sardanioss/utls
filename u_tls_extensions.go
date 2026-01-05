@@ -1340,10 +1340,18 @@ func (e *KeyShareExtension) UnmarshalJSON(b []byte) error {
 type QUICTransportParametersExtension struct {
 	TransportParameters TransportParameters
 
+	// RawData allows setting pre-marshaled transport parameters directly.
+	// If set, this takes precedence over TransportParameters.
+	// This is used when the QUIC layer (e.g., quic-go) provides already-marshaled params.
+	RawData []byte
+
 	marshalResult []byte // TransportParameters will be marshaled into this slice
 }
 
 func (e *QUICTransportParametersExtension) Len() int {
+	if e.RawData != nil {
+		return 4 + len(e.RawData)
+	}
 	if e.marshalResult == nil {
 		e.marshalResult = e.TransportParameters.Marshal()
 	}
@@ -1357,10 +1365,19 @@ func (e *QUICTransportParametersExtension) Read(b []byte) (int, error) {
 
 	b[0] = byte(extensionQUICTransportParameters >> 8)
 	b[1] = byte(extensionQUICTransportParameters)
-	// e.Len() is called before so that e.marshalResult is set
-	b[2] = byte((len(e.marshalResult)) >> 8)
-	b[3] = byte(len(e.marshalResult))
-	copy(b[4:], e.marshalResult)
+
+	// Use RawData if set, otherwise use marshaled TransportParameters
+	var data []byte
+	if e.RawData != nil {
+		data = e.RawData
+	} else {
+		// e.Len() is called before so that e.marshalResult is set
+		data = e.marshalResult
+	}
+
+	b[2] = byte((len(data)) >> 8)
+	b[3] = byte(len(data))
+	copy(b[4:], data)
 
 	return e.Len(), io.EOF
 }
@@ -1942,5 +1959,36 @@ func (e *FakeDelegatedCredentialsExtension) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("unknown delegated credentials signature scheme: %s", sigScheme)
 		}
 	}
+	return nil
+}
+
+// FakeEarlyDataExtension implements the early_data extension (42) for QUIC 0-RTT indication
+// In ClientHello, this is an empty extension indicating 0-RTT support
+type FakeEarlyDataExtension struct{}
+
+func (e *FakeEarlyDataExtension) writeToUConn(uc *UConn) error {
+	return nil
+}
+
+func (e *FakeEarlyDataExtension) Len() int {
+	return 4 // just extension type (2 bytes) + length (2 bytes, value 0)
+}
+
+func (e *FakeEarlyDataExtension) Read(b []byte) (int, error) {
+	if len(b) < e.Len() {
+		return 0, io.ErrShortBuffer
+	}
+	b[0] = byte(extensionEarlyData >> 8)
+	b[1] = byte(extensionEarlyData)
+	b[2] = 0 // length high byte
+	b[3] = 0 // length low byte
+	return e.Len(), io.EOF
+}
+
+func (e *FakeEarlyDataExtension) Write(b []byte) (int, error) {
+	return len(b), nil
+}
+
+func (e *FakeEarlyDataExtension) UnmarshalJSON(_ []byte) error {
 	return nil
 }

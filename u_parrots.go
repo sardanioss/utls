@@ -1183,6 +1183,74 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&UtlsGREASEExtension{},
 			},
 		}, nil
+
+	// Chrome 143 QUIC - Specific preset for HTTP/3 QUIC connections
+	// Captured from real Chrome 143.0.0.0 QUIC connection
+	// Key differences from TCP: No legacy TLS 1.2 extensions, different extension order
+	// Note: quic_transport_parameters (57) is added by the QUIC layer, not here
+	case HelloChrome_143_QUIC:
+		// Chrome 143 QUIC fingerprint - matches real Chrome production
+		// Note: X25519MLKEM768 key generation not fully supported yet, using X25519 fallback
+		// This works because servers negotiate down to X25519 when MLKEM not supported
+		return ClientHelloSpec{
+			CipherSuites: []uint16{
+				// Chrome QUIC uses only TLS 1.3 ciphers
+				TLS_AES_128_GCM_SHA256,
+				TLS_AES_256_GCM_SHA384,
+				TLS_CHACHA20_POLY1305_SHA256,
+			},
+			CompressionMethods: []byte{
+				0x00, // compressionNone
+			},
+			// Chrome QUIC extension order - based on real Chrome 143 fingerprint
+			Extensions: []TLSExtension{
+				// 1. application_settings (17613)
+				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h3"}},
+				// 2. encrypted_client_hello (65037) - GREASE ECH
+				BoringGREASEECH(),
+				// 3. application_layer_protocol_negotiation (16)
+				&ALPNExtension{AlpnProtocols: []string{"h3"}},
+				// 4. supported_groups (10) - Chrome order (without MLKEM for now)
+				&SupportedCurvesExtension{[]CurveID{
+					X25519,
+					CurveP256,
+					CurveP384,
+				}},
+				// 5. quic_transport_parameters (57)
+				&QUICTransportParametersExtension{},
+				// 6. psk_key_exchange_modes (45)
+				&PSKKeyExchangeModesExtension{[]uint8{
+					PskModeDHE,
+				}},
+				// 7. compress_certificate (27)
+				&UtlsCompressCertExtension{[]CertCompressionAlgo{
+					CertCompressionBrotli,
+				}},
+				// 8. key_share (51) - X25519 only for now
+				&KeyShareExtension{[]KeyShare{
+					{Group: X25519},
+				}},
+				// 10. server_name (0)
+				&SNIExtension{},
+				// 11. supported_versions (43) - only TLS 1.3
+				&SupportedVersionsExtension{[]uint16{
+					VersionTLS13,
+				}},
+				// 12. signature_algorithms (13) - includes PKCS1WithSHA1
+				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
+					ECDSAWithP256AndSHA256,
+					PSSWithSHA256,
+					PKCS1WithSHA256,
+					ECDSAWithP384AndSHA384,
+					PSSWithSHA384,
+					PKCS1WithSHA384,
+					PSSWithSHA512,
+					PKCS1WithSHA512,
+					PKCS1WithSHA1, // Chrome includes this
+				}},
+			},
+		}, nil
+
 	case HelloFirefox_55, HelloFirefox_56:
 		return ClientHelloSpec{
 			TLSVersMax: VersionTLS12,
@@ -3075,7 +3143,7 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 	var haveNPN bool
 
 	// reGrease, and point things to each other
-	for _, e := range uconn.Extensions {
+	for i, e := range uconn.Extensions {
 		switch ext := e.(type) {
 		case *SNIExtension:
 			if ext.ServerName == "" {
@@ -3107,6 +3175,10 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 				curveID := ext.KeyShares[i].Group
 				if isGREASEUint16(uint16(curveID)) { // just in case the user set a GREASE value instead of unGREASEd
 					ext.KeyShares[i].Group = CurveID(GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_group))
+					// GREASE keyshares need random 1-byte data
+					if len(ext.KeyShares[i].Data) == 0 {
+						ext.KeyShares[i].Data = []byte{0x00}
+					}
 					continue
 				}
 				if len(ext.KeyShares[i].Data) > 1 {
@@ -3157,6 +3229,15 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 			}
 		case *NPNExtension:
 			haveNPN = true
+		case *QUICTransportParametersExtension:
+			// For QUIC connections, fill in the transport parameters from the QUIC layer
+			// We need to create a new instance to avoid sharing state across connections
+			if uconn.quic != nil && uconn.quic.transportParams != nil {
+				newExt := &QUICTransportParametersExtension{
+					RawData: uconn.quic.transportParams,
+				}
+				uconn.Extensions[i] = newExt
+			}
 		}
 	}
 
