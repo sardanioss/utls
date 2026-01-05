@@ -650,6 +650,10 @@ var (
 	HelloChrome_143_Linux   = ClientHelloID{helloChrome, "143_Linux", nil, nil}
 	HelloChrome_143_macOS   = ClientHelloID{helloChrome, "143_macOS", nil, nil}
 
+	// Chrome 143 QUIC-specific preset for HTTP/3 connections
+	// Uses different TLS extensions compared to TCP (no legacy TLS 1.2 extensions)
+	HelloChrome_143_QUIC = ClientHelloID{helloChrome, "143_QUIC", nil, nil}
+
 	HelloIOS_Auto = HelloIOS_14
 	HelloIOS_11_1 = ClientHelloID{helloIOS, "111", nil, nil} // legacy "111" means 11.1
 	HelloIOS_12_1 = ClientHelloID{helloIOS, "12.1", nil, nil}
