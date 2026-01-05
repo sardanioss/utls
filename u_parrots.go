@@ -1190,8 +1190,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 	// Note: quic_transport_parameters (57) is added by the QUIC layer, not here
 	case HelloChrome_143_QUIC:
 		// Chrome 143 QUIC fingerprint - matches real Chrome production
-		// Note: X25519MLKEM768 key generation not fully supported yet, using X25519 fallback
-		// This works because servers negotiate down to X25519 when MLKEM not supported
+		// Includes X25519MLKEM768 (post-quantum hybrid) for key exchange
 		return ClientHelloSpec{
 			CipherSuites: []uint16{
 				// Chrome QUIC uses only TLS 1.3 ciphers
@@ -1210,8 +1209,9 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				BoringGREASEECH(),
 				// 3. application_layer_protocol_negotiation (16)
 				&ALPNExtension{AlpnProtocols: []string{"h3"}},
-				// 4. supported_groups (10) - Chrome order (without MLKEM for now)
+				// 4. supported_groups (10) - Chrome order with PQ hybrid
 				&SupportedCurvesExtension{[]CurveID{
+					X25519MLKEM768,
 					X25519,
 					CurveP256,
 					CurveP384,
@@ -1226,8 +1226,9 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
 				}},
-				// 8. key_share (51) - X25519 only for now
+				// 8. key_share (51) - PQ hybrid + X25519
 				&KeyShareExtension{[]KeyShare{
+					{Group: X25519MLKEM768},
 					{Group: X25519},
 				}},
 				// 10. server_name (0)
