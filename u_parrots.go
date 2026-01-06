@@ -979,11 +979,9 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Fixed extension order for Chrome - matches real production Chrome
-			// Order: GREASE, compress_cert, ALPN, renegotiation, status_request, app_settings,
-			//        SNI, SCT, supported_versions, ECH, ec_point_formats, sig_algs,
-			//        psk_modes, session_ticket, extended_master_secret, supported_groups, key_share, GREASE
-			Extensions: []TLSExtension{
+			// Chrome extension order with shuffling (Chrome shuffles extensions since v110)
+			// GREASE extensions stay at boundaries, others are shuffled
+			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
@@ -1031,9 +1029,9 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&UtlsGREASEExtension{},
-			},
+			}),
 		}, nil
-	// Chrome 143 Linux - Fixed extension order matching real Chrome production
+	// Chrome 143 Linux - extension order with shuffling (Chrome shuffles since v110)
 	case HelloChrome_143_Linux:
 		return ClientHelloSpec{
 			CipherSuites: []uint16{
@@ -1057,8 +1055,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Fixed extension order for Chrome - matches real production Chrome
-			Extensions: []TLSExtension{
+			// Chrome extension order with shuffling (Chrome shuffles extensions since v110)
+			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
@@ -1106,9 +1104,9 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&UtlsGREASEExtension{},
-			},
+			}),
 		}, nil
-	// Chrome 143 macOS - Fixed extension order matching real Chrome production
+	// Chrome 143 macOS - extension order with shuffling (Chrome shuffles since v110)
 	case HelloChrome_143_macOS:
 		return ClientHelloSpec{
 			CipherSuites: []uint16{
@@ -1132,8 +1130,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Fixed extension order for Chrome - matches real production Chrome
-			Extensions: []TLSExtension{
+			// Chrome extension order with shuffling (Chrome shuffles extensions since v110)
+			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
@@ -1181,7 +1179,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					{Group: X25519},
 				}},
 				&UtlsGREASEExtension{},
-			},
+			}),
 		}, nil
 
 	// Chrome 143 QUIC - Specific preset for HTTP/3 QUIC connections
@@ -1201,43 +1199,43 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Chrome QUIC extension order - based on real Chrome 143 fingerprint
-			Extensions: []TLSExtension{
-				// 1. application_settings (17613)
+			// Chrome QUIC extension order with shuffling (Chrome shuffles since v110)
+			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
+				// application_settings (17613)
 				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h3"}},
-				// 2. encrypted_client_hello (65037) - GREASE ECH
+				// encrypted_client_hello (65037) - GREASE ECH
 				BoringGREASEECH(),
-				// 3. application_layer_protocol_negotiation (16)
+				// application_layer_protocol_negotiation (16)
 				&ALPNExtension{AlpnProtocols: []string{"h3"}},
-				// 4. supported_groups (10) - Chrome order with PQ hybrid
+				// supported_groups (10) - Chrome order with PQ hybrid
 				&SupportedCurvesExtension{[]CurveID{
 					X25519MLKEM768,
 					X25519,
 					CurveP256,
 					CurveP384,
 				}},
-				// 5. quic_transport_parameters (57)
+				// quic_transport_parameters (57)
 				&QUICTransportParametersExtension{},
-				// 6. psk_key_exchange_modes (45)
+				// psk_key_exchange_modes (45)
 				&PSKKeyExchangeModesExtension{[]uint8{
 					PskModeDHE,
 				}},
-				// 7. compress_certificate (27)
+				// compress_certificate (27)
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
 				}},
-				// 8. key_share (51) - PQ hybrid + X25519
+				// key_share (51) - PQ hybrid + X25519
 				&KeyShareExtension{[]KeyShare{
 					{Group: X25519MLKEM768},
 					{Group: X25519},
 				}},
-				// 10. server_name (0)
+				// server_name (0)
 				&SNIExtension{},
-				// 11. supported_versions (43) - only TLS 1.3
+				// supported_versions (43) - only TLS 1.3
 				&SupportedVersionsExtension{[]uint16{
 					VersionTLS13,
 				}},
-				// 12. signature_algorithms (13) - includes PKCS1WithSHA1
+				// signature_algorithms (13) - includes PKCS1WithSHA1
 				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
 					ECDSAWithP256AndSHA256,
 					PSSWithSHA256,
@@ -1249,7 +1247,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					PKCS1WithSHA512,
 					PKCS1WithSHA1, // Chrome includes this
 				}},
-			},
+			}),
 		}, nil
 
 	// Chrome 133 with PSK for session resumption
@@ -1352,8 +1350,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Fixed extension order for Chrome Windows + PSK at end
-			Extensions: []TLSExtension{
+			// Chrome extension order with shuffling + PSK at end (Chrome shuffles since v110)
+			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&ExtendedMasterSecretExtension{},
 				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
@@ -1402,7 +1400,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&SessionTicketExtension{},
 				&UtlsGREASEExtension{},
 				&UtlsPreSharedKeyExtension{}, // PSK must be last extension
-			},
+			}),
 		}, nil
 
 	// Chrome 143 Linux with PSK for session resumption
@@ -1429,8 +1427,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Fixed extension order for Chrome Linux + PSK at end
-			Extensions: []TLSExtension{
+			// Chrome extension order with shuffling + PSK at end (Chrome shuffles since v110)
+			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&UtlsCompressCertExtension{[]CertCompressionAlgo{
 					CertCompressionBrotli,
@@ -1479,7 +1477,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				}},
 				&UtlsGREASEExtension{},
 				&UtlsPreSharedKeyExtension{}, // PSK must be last extension
-			},
+			}),
 		}, nil
 
 	// Chrome 143 macOS with PSK for session resumption
@@ -1506,8 +1504,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Fixed extension order for Chrome macOS + PSK at end
-			Extensions: []TLSExtension{
+			// Chrome extension order with shuffling + PSK at end (Chrome shuffles since v110)
+			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&UtlsGREASEExtension{},
 				&SCTExtension{},
 				&RenegotiationInfoExtension{Renegotiation: RenegotiateOnceAsClient},
@@ -1556,7 +1554,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&SessionTicketExtension{},
 				&UtlsGREASEExtension{},
 				&UtlsPreSharedKeyExtension{}, // PSK must be last extension
-			},
+			}),
 		}, nil
 
 	// Chrome 143 QUIC with PSK for session resumption
@@ -1570,8 +1568,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Chrome QUIC extension order + PSK at end
-			Extensions: []TLSExtension{
+			// Chrome QUIC extension order with shuffling + PSK at end (Chrome shuffles since v110)
+			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
 				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h3"}},
 				BoringGREASEECH(),
 				&ALPNExtension{AlpnProtocols: []string{"h3"}},
@@ -1608,7 +1606,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					PKCS1WithSHA1,
 				}},
 				&UtlsPreSharedKeyExtension{}, // PSK must be last extension
-			},
+			}),
 		}, nil
 
 	case HelloFirefox_55, HelloFirefox_56:
