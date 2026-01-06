@@ -164,19 +164,28 @@ func (q *UQUICConn) SetTransportParameters(params []byte) {
 	if params == nil {
 		params = []byte{}
 	}
-	q.conn.quic.transportParams = params // this won't be used for building ClientHello when using a preset
+	q.conn.quic.transportParams = params
 
-	// // instead, we set the transport parameters hold by the ClientHello
-	// for _, ext := range q.conn.Extensions {
-	// 	if qtp, ok := ext.(*QUICTransportParametersExtension); ok {
-	// 		qtp.TransportParametersExtData = params
-	// 	}
-	// }
+	// When using a preset (HelloCustom + ApplyPreset), we also need to set
+	// the transport parameters in the QUICTransportParametersExtension
+	// This ensures the extension has the actual transport params for the ClientHello
+	for _, ext := range q.conn.Extensions {
+		if qtp, ok := ext.(*QUICTransportParametersExtension); ok {
+			qtp.RawData = params
+		}
+	}
 
 	if q.conn.quic.started {
 		<-q.conn.quic.signalc
 		<-q.conn.quic.blockedc
 	}
+}
+
+// GetGREASESeed returns the GREASE seed used by this connection.
+// This can be used to cache the seed and apply it to future connections
+// via ClientHelloSpec.GREASESeed for consistent TLS fingerprints.
+func (q *UQUICConn) GetGREASESeed() [ssl_grease_last_index]uint16 {
+	return q.conn.greaseSeed
 }
 
 func (uc *UConn) QUICSetReadSecret(level QUICEncryptionLevel, suite uint16, secret []byte) {
