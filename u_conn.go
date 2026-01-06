@@ -762,6 +762,13 @@ func (uconn *UConn) GetUnderlyingConn() net.Conn {
 	return uconn.Conn.conn
 }
 
+// GetGREASESeed returns the GREASE seed used by this connection.
+// This can be used to cache the seed and apply it to future connections
+// via ClientHelloSpec.GREASESeed for consistent TLS fingerprints.
+func (uconn *UConn) GetGREASESeed() [ssl_grease_last_index]uint16 {
+	return uconn.greaseSeed
+}
+
 // MakeConnWithCompleteHandshake allows to forge both server and client side TLS connections.
 // Major Hack Alert.
 func MakeConnWithCompleteHandshake(tcpConn net.Conn, version uint16, cipherSuite uint16, masterSecret []byte, clientRandom []byte, serverRandom []byte, isClient bool) *Conn {

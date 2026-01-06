@@ -3459,17 +3459,33 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 	}
 
 	// Currently, GREASE is assumed to come from BoringSSL
-	grease_bytes := make([]byte, 2*ssl_grease_last_index)
 	grease_extensions_seen := 0
-	_, err = io.ReadFull(uconn.config.rand(), grease_bytes)
-	if err != nil {
-		return errors.New("tls: short read from Rand: " + err.Error())
+
+	// Check if spec has cached GREASESeed (non-zero means it was set)
+	hasGREASESeed := false
+	for _, v := range p.GREASESeed {
+		if v != 0 {
+			hasGREASESeed = true
+			break
+		}
 	}
-	for i := range uconn.greaseSeed {
-		uconn.greaseSeed[i] = binary.LittleEndian.Uint16(grease_bytes[2*i : 2*i+2])
-	}
-	if GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension1) == GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension2) {
-		uconn.greaseSeed[ssl_grease_extension2] ^= 0x1010
+
+	if hasGREASESeed {
+		// Use the cached GREASE seed from the spec
+		uconn.greaseSeed = p.GREASESeed
+	} else {
+		// Generate new random GREASE values
+		grease_bytes := make([]byte, 2*ssl_grease_last_index)
+		_, err = io.ReadFull(uconn.config.rand(), grease_bytes)
+		if err != nil {
+			return errors.New("tls: short read from Rand: " + err.Error())
+		}
+		for i := range uconn.greaseSeed {
+			uconn.greaseSeed[i] = binary.LittleEndian.Uint16(grease_bytes[2*i : 2*i+2])
+		}
+		if GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension1) == GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_extension2) {
+			uconn.greaseSeed[ssl_grease_extension2] ^= 0x1010
+		}
 	}
 
 	hello.CipherSuites = make([]uint16, len(p.CipherSuites))
