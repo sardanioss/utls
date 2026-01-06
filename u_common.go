@@ -193,6 +193,11 @@ type ClientHelloSpec struct {
 	// sessionID may or may not depend on ticket; nil => random
 	GetSessionID func(ticket []byte) [32]byte
 
+	// GREASESeed is the seed used to generate GREASE values.
+	// If set (non-zero), ApplyPreset will use these values instead of generating random ones.
+	// This allows consistent GREASE values across multiple connections using the same spec.
+	GREASESeed [ssl_grease_last_index]uint16
+
 	// TLSFingerprintLink string // ?? link to tlsfingerprint.io for informational purposes
 }
 
