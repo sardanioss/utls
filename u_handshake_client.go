@@ -491,7 +491,8 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		// work around _possibly_ broken middleboxes, but there is little-to-no
 		// evidence that this is actually a problem.
 
-		if err := computeAndUpdateOuterECHExtension(hello, ech.innerHello, ech, true); err != nil {
+		// Use UConn method to ensure proper ech_outer_extensions handling
+		if err := c.computeAndUpdateOuterECHExtension(ech.innerHello, ech, true); err != nil {
 			return err
 		}
 	}

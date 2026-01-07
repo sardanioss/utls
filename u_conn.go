@@ -155,9 +155,10 @@ func (uconn *UConn) buildHandshakeState(loadSession bool) error {
 		if loadSession {
 			uconn.uApplyPatch()
 			uconn.sessionController.finalCheck()
-			uconn.clientHelloBuildStatus = BuildByUtls
 		}
 
+		// Always mark as BuildByUtls after MarshalClientHello succeeds
+		uconn.clientHelloBuildStatus = BuildByUtls
 	}
 	return nil
 }
@@ -571,11 +572,39 @@ func (uconn *UConn) MarshalClientHello() error {
 			return err
 		}
 
+		// For ECH inner hello, explicitly clear TLS 1.2 legacy extensions
+		// These should NOT be in the inner hello regardless of QUIC status
+		// Chrome QUIC doesn't use SCT at all
+		inner.scts = false
+		inner.ocspStapling = false
+		inner.extendedMasterSecret = false
+		inner.supportedPoints = nil
+		inner.secureRenegotiationSupported = false
+		inner.ticketSupported = false
+
 		// copy compressed extensions to the ClientHelloInner
+		// These are extensions that will be referenced via ech_outer_extensions
 		inner.keyShares = KeyShares(uconn.HandshakeState.Hello.KeyShares).ToPrivate()
 		inner.supportedSignatureAlgorithms = uconn.HandshakeState.Hello.SupportedSignatureAlgorithms
 		inner.sessionId = uconn.HandshakeState.Hello.SessionId
 		inner.supportedCurves = uconn.HandshakeState.Hello.SupportedCurves
+		inner.pskModes = uconn.HandshakeState.Hello.PskModes
+
+		// Get QUIC transport parameters from the extension (not from PubClientHelloMsg field)
+		// The extension contains the actual marshaled transport parameters
+		for _, ext := range uconn.Extensions {
+			if qtpExt, ok := ext.(*QUICTransportParametersExtension); ok {
+				// Marshal the extension to get the transport parameters data
+				extLen := qtpExt.Len()
+				if extLen > 4 { // 2 bytes for type + 2 bytes for length
+					buf := make([]byte, extLen)
+					qtpExt.Read(buf)
+					// Skip the 4-byte header (type + length), get the actual data
+					inner.quicTransportParameters = buf[4:]
+				}
+				break
+			}
+		}
 
 		ech.innerHello = inner
 

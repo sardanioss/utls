@@ -113,6 +113,15 @@ func (m *clientHelloMsg) marshalMsg(echInner bool) ([]byte, error) {
 func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []uint16) ([]byte, error) {
 	// [uTLS SECTION END]
 	var exts cryptobyte.Builder
+
+	// For ECH inner hello, Chrome puts ech_inner marker FIRST, before server_name
+	if echInner && len(m.encryptedClientHello) > 0 {
+		exts.AddUint16(extensionEncryptedClientHello)
+		exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+			exts.AddBytes(m.encryptedClientHello)
+		})
+	}
+
 	if len(m.serverName) > 0 {
 		// RFC 6066, Section 3
 		exts.AddUint16(extensionServerName)
@@ -155,7 +164,7 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 		exts.AddUint16(extensionExtendedMasterSecret)
 		exts.AddUint16(0) // empty extension_data
 	}
-	if m.scts {
+	if m.scts && !echInner {
 		// RFC 6962, Section 3.3.1
 		exts.AddUint16(extensionSCT)
 		exts.AddUint16(0) // empty extension_data
@@ -165,14 +174,15 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 		exts.AddUint16(extensionEarlyData)
 		exts.AddUint16(0) // empty extension_data
 	}
-	if m.quicTransportParameters != nil { // marshal zero-length parameters when present
+	if m.quicTransportParameters != nil && !echInner { // marshal zero-length parameters when present
 		// RFC 9001, Section 8.2
 		exts.AddUint16(extensionQUICTransportParameters)
 		exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
 			exts.AddBytes(m.quicTransportParameters)
 		})
 	}
-	if len(m.encryptedClientHello) > 0 {
+	// For non-ECH inner, add encryptedClientHello here (for echInner, it's added first above)
+	if len(m.encryptedClientHello) > 0 && !echInner {
 		exts.AddUint16(extensionEncryptedClientHello)
 		exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
 			exts.AddBytes(m.encryptedClientHello)
@@ -183,6 +193,13 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 	// be added to the following block, so that they can be properly
 	// decompressed on the other side.
 	var echOuterExts []uint16
+	// For ECH inner hello, use ech_outer_extensions to reference extensions
+	// from outer hello instead of duplicating them (Chrome behavior)
+	if m.quicTransportParameters != nil && echInner {
+		echOuterExts = append(echOuterExts, extensionQUICTransportParameters)
+	}
+	// Note: SCT (signed_certificate_timestamp) is NOT included in echOuterExts
+	// Chrome QUIC doesn't use SCT at all, and TCP Chrome doesn't include it in ECH inner
 	if m.ocspStapling {
 		// RFC 4366, Section 3.6
 		if echInner {
@@ -260,7 +277,7 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 	}
 	if len(m.supportedVersions) > 0 {
 		// RFC 8446, Section 4.2.1
-		if echInner && outerExts == nil { // uTLS
+		if echInner {
 			echOuterExts = append(echOuterExts, extensionSupportedVersions)
 		} else {
 			exts.AddUint16(extensionSupportedVersions)
@@ -318,10 +335,41 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 		}
 	}
 	// [uTLS SECTION BEGIN]
-	// reorder OuterExtensions according to their order in the spec
+	// Add uTLS-specific extensions to echOuterExts if they're in the outer hello
+	// These extensions are handled by TLSExtension interface, not clientHelloMsg fields
 	if echInner && outerExts != nil {
+		// compress_certificate (27) - Chrome includes this in ech_outer_extensions
+		if slices.Contains(outerExts, utlsExtensionCompressCertificate) {
+			echOuterExts = append(echOuterExts, utlsExtensionCompressCertificate)
+		}
+		// application_settings (17613) - Chrome includes this in ech_outer_extensions
+		if slices.Contains(outerExts, utlsExtensionApplicationSettingsNew) {
+			echOuterExts = append(echOuterExts, utlsExtensionApplicationSettingsNew)
+		}
+		// application_settings old (17513) - for older Chrome versions
+		if slices.Contains(outerExts, utlsExtensionApplicationSettings) {
+			echOuterExts = append(echOuterExts, utlsExtensionApplicationSettings)
+		}
+	}
+	// Reorder echOuterExts to match Chrome's specific order for ech_outer_extensions
+	// Chrome order: ALPN, key_share, compress_certificate, signature_algorithms,
+	//               application_settings, supported_versions, psk_key_exchange_modes,
+	//               supported_groups, quic_transport_parameters
+	if echInner && outerExts != nil {
+		chromeECHOuterOrder := []uint16{
+			extensionALPN,                         // 16
+			extensionKeyShare,                     // 51
+			utlsExtensionCompressCertificate,      // 27
+			extensionSignatureAlgorithms,          // 13
+			utlsExtensionApplicationSettingsNew,   // 17613
+			utlsExtensionApplicationSettings,      // 17513 (fallback)
+			extensionSupportedVersions,            // 43
+			extensionPSKModes,                     // 45
+			extensionSupportedCurves,              // 10 (supported_groups)
+			extensionQUICTransportParameters,      // 57 (LAST)
+		}
 		echOuterExtsReordered := slices.Collect(func(yield func(uint16) bool) {
-			for _, ext := range outerExts {
+			for _, ext := range chromeECHOuterOrder {
 				if slices.Contains(echOuterExts, ext) {
 					if !yield(ext) {
 						return
