@@ -1201,20 +1201,32 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Chrome QUIC extension order - EXACT order, no shuffling
-			// Chrome QUIC does NOT have leading/trailing GREASE or GREASE in key_share/supported_groups
+			// Chrome QUIC extension order - EXACT order from real Chrome capture
+			// Order: [17613, 45, 65037, 10, 16, 43, 0, 13, 27, 57, 51]
 			Extensions: []TLSExtension{
+				// application_settings (17613)
+				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h3"}},
+				// psk_key_exchange_modes (45)
+				&PSKKeyExchangeModesExtension{[]uint8{
+					PskModeDHE,
+				}},
+				// encrypted_client_hello (65037) - GREASE ECH
+				BoringGREASEECH(),
+				// supported_groups (10) - Chrome QUIC order (no GREASE)
+				&SupportedCurvesExtension{[]CurveID{
+					X25519MLKEM768,
+					X25519,
+					CurveP256,
+					CurveP384,
+				}},
 				// application_layer_protocol_negotiation (16)
 				&ALPNExtension{AlpnProtocols: []string{"h3"}},
-				// key_share (51) - PQ hybrid + X25519 (no GREASE)
-				&KeyShareExtension{[]KeyShare{
-					{Group: X25519MLKEM768},
-					{Group: X25519},
+				// supported_versions (43) - only TLS 1.3
+				&SupportedVersionsExtension{[]uint16{
+					VersionTLS13,
 				}},
-				// compress_certificate (27)
-				&UtlsCompressCertExtension{[]CertCompressionAlgo{
-					CertCompressionBrotli,
-				}},
+				// server_name (0)
+				&SNIExtension{},
 				// signature_algorithms (13) - includes PKCS1WithSHA1
 				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
 					ECDSAWithP256AndSHA256,
@@ -1227,29 +1239,17 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 					PKCS1WithSHA512,
 					PKCS1WithSHA1, // Chrome includes this
 				}},
-				// application_settings (17613)
-				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h3"}},
-				// encrypted_client_hello (65037) - GREASE ECH
-				BoringGREASEECH(),
-				// supported_versions (43) - only TLS 1.3
-				&SupportedVersionsExtension{[]uint16{
-					VersionTLS13,
+				// compress_certificate (27)
+				&UtlsCompressCertExtension{[]CertCompressionAlgo{
+					CertCompressionBrotli,
 				}},
-				// psk_key_exchange_modes (45)
-				&PSKKeyExchangeModesExtension{[]uint8{
-					PskModeDHE,
-				}},
-				// supported_groups (10) - Chrome QUIC order (no GREASE)
-				&SupportedCurvesExtension{[]CurveID{
-					X25519MLKEM768,
-					X25519,
-					CurveP256,
-					CurveP384,
-				}},
-				// server_name (0)
-				&SNIExtension{},
 				// quic_transport_parameters (57)
 				&QUICTransportParametersExtension{},
+				// key_share (51) - PQ hybrid + X25519 (no GREASE)
+				&KeyShareExtension{[]KeyShare{
+					{Group: X25519MLKEM768},
+					{Group: X25519},
+				}},
 			},
 		}, nil
 
