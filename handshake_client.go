@@ -72,19 +72,27 @@ func (c *Conn) makeClientHello() (*clientHelloMsg, *keySharePrivateKeys, *echCli
 	}
 	maxVersion := config.maxSupportedVersion(roleClient)
 
+	// For QUIC connections (TLS 1.3 only), don't include TLS 1.2 legacy extensions
+	// These fields create extensions that shouldn't be in a QUIC ClientHello
+	isQUIC := c.quic != nil
+
 	hello := &clientHelloMsg{
-		vers:                         maxVersion,
-		compressionMethods:           []uint8{compressionNone},
-		random:                       make([]byte, 32),
-		extendedMasterSecret:         true,
-		ocspStapling:                 true,
-		scts:                         true,
-		serverName:                   hostnameInSNI(config.ServerName),
-		supportedCurves:              config.curvePreferences(maxVersion),
-		supportedPoints:              []uint8{pointFormatUncompressed},
-		secureRenegotiationSupported: true,
-		alpnProtocols:                config.NextProtos,
-		supportedVersions:            supportedVersions,
+		vers:               maxVersion,
+		compressionMethods: []uint8{compressionNone},
+		random:             make([]byte, 32),
+		serverName:         hostnameInSNI(config.ServerName),
+		supportedCurves:    config.curvePreferences(maxVersion),
+		alpnProtocols:      config.NextProtos,
+		supportedVersions:  supportedVersions,
+	}
+
+	// Only include TLS 1.2 legacy extensions for non-QUIC connections
+	if !isQUIC {
+		hello.extendedMasterSecret = true
+		hello.ocspStapling = true
+		hello.scts = true
+		hello.supportedPoints = []uint8{pointFormatUncompressed}
+		hello.secureRenegotiationSupported = true
 	}
 
 	// The version at the beginning of the ClientHello was capped at TLS 1.2
