@@ -566,6 +566,12 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 }
 
 func (uconn *UConn) MarshalClientHello() error {
+	// Ensure ApplyConfig is called to populate HandshakeState.Hello fields from extensions
+	// This is needed when ApplyPreset is called directly without going through BuildHandshakeState
+	if err := uconn.ApplyConfig(); err != nil {
+		return err
+	}
+
 	if len(uconn.config.EncryptedClientHelloConfigList) > 0 {
 		inner, _, ech, err := uconn.makeClientHello()
 		if err != nil {
@@ -608,7 +614,9 @@ func (uconn *UConn) MarshalClientHello() error {
 
 		ech.innerHello = inner
 
-		uconn.computeAndUpdateOuterECHExtension(inner, ech, true)
+		if err := uconn.computeAndUpdateOuterECHExtension(inner, ech, true); err != nil {
+			return err
+		}
 
 		uconn.echCtx = ech
 		return nil
