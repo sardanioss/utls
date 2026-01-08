@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 
@@ -216,11 +217,38 @@ func encodeInnerClientHello(inner *clientHelloMsg, maxNameLength int) ([]byte, e
 
 // func encodeInnerClientHello(inner *clientHelloMsg, maxNameLength int) ([]byte, error) {
 func encodeInnerClientHelloReorderOuterExts(inner *clientHelloMsg, maxNameLength int, outerExts []uint16) ([]byte, error) { // uTLS
+	// Debug: print inner hello info
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		fmt.Printf("[ECH DEBUG] Inner hello before marshal:\n")
+		fmt.Printf("  serverName: %s\n", inner.serverName)
+		fmt.Printf("  sessionId len: %d\n", len(inner.sessionId))
+		fmt.Printf("  encryptedClientHello: %v\n", inner.encryptedClientHello)
+		fmt.Printf("  keyShares len: %d\n", len(inner.keyShares))
+		for i, ks := range inner.keyShares {
+			fmt.Printf("    keyShare[%d]: group=%d, data_len=%d\n", i, ks.group, len(ks.data))
+		}
+		fmt.Printf("  pskModes len: %d\n", len(inner.pskModes))
+		fmt.Printf("  supportedCurves len: %d\n", len(inner.supportedCurves))
+		fmt.Printf("  supportedVersions len: %d\n", len(inner.supportedVersions))
+		fmt.Printf("  alpnProtocols: %v\n", inner.alpnProtocols)
+		fmt.Printf("  outerExts: %v\n", outerExts)
+	}
+
 	h, err := inner.marshalMsgReorderOuterExts(true, outerExts)
 	if err != nil {
 		return nil, err
 	}
 	h = h[4:] // strip four byte prefix
+
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		fmt.Printf("[ECH DEBUG] Inner hello after marshal (len=%d):\n", len(h))
+		// Print all bytes in hex
+		fmt.Printf("  full bytes: %x\n", h)
+
+		// Also parse and show the ech_outer_extensions
+		fmt.Printf("[ECH DEBUG] Parsing inner hello extensions...\n")
+		parseInnerHelloExtensions(h)
+	}
 
 	var paddingLen int
 	if inner.serverName != "" {
@@ -231,6 +259,64 @@ func encodeInnerClientHelloReorderOuterExts(inner *clientHelloMsg, maxNameLength
 	paddingLen = 31 - ((len(h) + paddingLen - 1) % 32)
 
 	return append(h, make([]byte, paddingLen)...), nil
+}
+
+// parseInnerHelloExtensions parses and prints the extensions from an inner hello (for debugging)
+func parseInnerHelloExtensions(h []byte) {
+	// Skip: version(2) + random(32) + sessionID_len(1) + sessionID(var)
+	if len(h) < 35 {
+		fmt.Println("  Inner hello too short")
+		return
+	}
+	offset := 34 // version(2) + random(32)
+	sessionIDLen := int(h[offset])
+	offset += 1 + sessionIDLen
+
+	// Skip cipher suites
+	if offset+2 > len(h) {
+		fmt.Println("  Inner hello too short for cipher suites")
+		return
+	}
+	cipherSuitesLen := int(h[offset])<<8 | int(h[offset+1])
+	offset += 2 + cipherSuitesLen
+
+	// Skip compression methods
+	if offset+1 > len(h) {
+		fmt.Println("  Inner hello too short for compression")
+		return
+	}
+	compressionLen := int(h[offset])
+	offset += 1 + compressionLen
+
+	// Extensions
+	if offset+2 > len(h) {
+		fmt.Println("  No extensions in inner hello")
+		return
+	}
+	extensionsLen := int(h[offset])<<8 | int(h[offset+1])
+	offset += 2
+	fmt.Printf("  Extensions length: %d\n", extensionsLen)
+
+	endOffset := offset + extensionsLen
+	extNum := 0
+	for offset+4 <= len(h) && offset < endOffset {
+		extType := int(h[offset])<<8 | int(h[offset+1])
+		extLen := int(h[offset+2])<<8 | int(h[offset+3])
+		extNum++
+		fmt.Printf("  Ext %d: type=%d (0x%04x), len=%d\n", extNum, extType, extType, extLen)
+
+		if extType == 0xfd00 { // ech_outer_extensions
+			if offset+4+extLen <= len(h) && extLen > 0 {
+				listLen := int(h[offset+4])
+				fmt.Printf("    ech_outer_extensions list_len=%d, contains:\n", listLen)
+				for i := 0; i < listLen/2; i++ {
+					refExt := int(h[offset+5+i*2])<<8 | int(h[offset+5+i*2+1])
+					fmt.Printf("      - %d (0x%04x)\n", refExt, refExt)
+				}
+			}
+		}
+		offset += 4 + extLen
+	}
 }
 
 func skipUint8LengthPrefixed(s *cryptobyte.String) bool {

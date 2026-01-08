@@ -219,3 +219,23 @@ func (uc *UConn) QUICGetTransportParameters() ([]byte, error) {
 	}
 	return uc.quic.transportParams, nil
 }
+
+// GetUConn returns the underlying UConn for debugging purposes.
+func (q *UQUICConn) GetUConn() *UConn {
+	return q.conn
+}
+
+// MarshalClientHello is a wrapper around UConn.MarshalClientHello for QUIC.
+func (q *UQUICConn) MarshalClientHello() error {
+	return q.conn.MarshalClientHello()
+}
+
+// GetHandshakeState returns the handshake state for debugging.
+func (q *UQUICConn) GetHandshakeState() *PubClientHandshakeState {
+	return &q.conn.HandshakeState
+}
+
+// GetExtensions returns the extensions list for debugging.
+func (q *UQUICConn) GetExtensions() []TLSExtension {
+	return q.conn.Extensions
+}
