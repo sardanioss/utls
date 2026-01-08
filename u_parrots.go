@@ -30,6 +30,22 @@ func UTLSIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 	return utlsIdToSpec(id)
 }
 
+// UTLSIdToSpecWithSeed returns a ClientHelloSpec with extensions shuffled using a specific seed.
+// This ensures consistent extension order within a session while appearing random across sessions.
+// The seed should be generated once per session and reused for all connections in that session.
+func UTLSIdToSpecWithSeed(id ClientHelloID, seed int64) (ClientHelloSpec, error) {
+	spec, err := utlsIdToSpec(id)
+	if err != nil {
+		return spec, err
+	}
+
+	// Apply seeded shuffle to extensions
+	// This works for both TCP and QUIC presets
+	spec.Extensions = ShuffleChromeTLSExtensionsWithSeed(spec.Extensions, seed)
+
+	return spec, nil
+}
+
 func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 	switch id {
 	case HelloChrome_58, HelloChrome_62:
@@ -3387,6 +3403,29 @@ func ShuffleChromeTLSExtensions(exts []TLSExtension) []TLSExtension {
 			exts[i], exts[j] = exts[j], exts[i]
 		})
 	}
+
+	return exts
+}
+
+// ShuffleChromeTLSExtensionsWithSeed shuffles extensions using a specific seed for deterministic shuffling.
+// This allows consistent extension order within a session while still appearing random.
+// Use the same seed for all connections in a session to maintain consistent fingerprint.
+func ShuffleChromeTLSExtensionsWithSeed(exts []TLSExtension, seed int64) []TLSExtension {
+	var skipShuf = func(idx int, exts []TLSExtension) bool {
+		switch exts[idx].(type) {
+		case *UtlsGREASEExtension, *UtlsPaddingExtension, PreSharedKeyExtension:
+			return true
+		default:
+			return false
+		}
+	}
+
+	rand.New(rand.NewSource(seed)).Shuffle(len(exts), func(i, j int) {
+		if skipShuf(i, exts) || skipShuf(j, exts) {
+			return
+		}
+		exts[i], exts[j] = exts[j], exts[i]
+	})
 
 	return exts
 }
