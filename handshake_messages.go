@@ -115,85 +115,67 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 	var exts cryptobyte.Builder
 	var echOuterExts []uint16
 
-	// For ECH inner hello with Chrome order, we need to match the outer hello's extension order
-	// Chrome QUIC extension order: [17613, 45, 65037, 10, 16, 43, 0, 13, 27, 57, 51]
-	// The inner hello should have the same order, with:
-	// - ECH extension (65037) being the inner marker (0x01)
-	// - server_name (0) having the real domain
-	// - Other extensions can be compressed via ech_outer_extensions
+	// For ECH inner hello, Chrome uses a FIXED structure:
+	// 1. ECH inner marker (65037) - ALWAYS first
+	// 2. server_name (0) - ALWAYS second (with real domain)
+	// 3. ech_outer_extensions (64768) - ALWAYS third (references outer extensions)
+	//
+	// The ech_outer_extensions list contains extension IDs in the order they appear
+	// in the outer hello (which may be shuffled), but the inner hello structure is fixed.
 
 	if echInner && outerExts != nil {
-		// Generate extensions in Chrome's outer hello order for inner hello
-		// We need to iterate through outerExts and add each extension
+		// 1. ECH inner marker - ALWAYS first
+		if len(m.encryptedClientHello) > 0 {
+			exts.AddUint16(extensionEncryptedClientHello)
+			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+				exts.AddBytes(m.encryptedClientHello)
+			})
+		}
 
+		// 2. server_name - ALWAYS second (with real domain)
+		if len(m.serverName) > 0 {
+			exts.AddUint16(extensionServerName)
+			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint8(0) // name_type = host_name
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddBytes([]byte(m.serverName))
+					})
+				})
+			})
+		}
+
+		// 3. Build ech_outer_extensions list - order follows outer hello
+		// Iterate through outer extensions and add compressible ones to the list
 		for _, extType := range outerExts {
 			switch extType {
 			case utlsExtensionApplicationSettingsNew, utlsExtensionApplicationSettings:
-				// application_settings - add to ech_outer_extensions (same in inner and outer)
 				if slices.Contains(outerExts, utlsExtensionApplicationSettingsNew) {
 					echOuterExts = append(echOuterExts, utlsExtensionApplicationSettingsNew)
 				} else if slices.Contains(outerExts, utlsExtensionApplicationSettings) {
 					echOuterExts = append(echOuterExts, utlsExtensionApplicationSettings)
 				}
-
 			case extensionPSKModes:
-				// psk_key_exchange_modes - add to ech_outer_extensions
 				echOuterExts = append(echOuterExts, extensionPSKModes)
-
-			case extensionEncryptedClientHello:
-				// ECH extension - add inner marker directly
-				if len(m.encryptedClientHello) > 0 {
-					exts.AddUint16(extensionEncryptedClientHello)
-					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
-						exts.AddBytes(m.encryptedClientHello)
-					})
-				}
-
 			case extensionSupportedCurves:
-				// supported_groups - add to ech_outer_extensions
 				echOuterExts = append(echOuterExts, extensionSupportedCurves)
-
 			case extensionALPN:
-				// ALPN - add to ech_outer_extensions
 				echOuterExts = append(echOuterExts, extensionALPN)
-
 			case extensionSupportedVersions:
-				// supported_versions - add to ech_outer_extensions
 				echOuterExts = append(echOuterExts, extensionSupportedVersions)
-
-			case extensionServerName:
-				// server_name - add directly with real domain
-				if len(m.serverName) > 0 {
-					exts.AddUint16(extensionServerName)
-					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
-						exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
-							exts.AddUint8(0) // name_type = host_name
-							exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
-								exts.AddBytes([]byte(m.serverName))
-							})
-						})
-					})
-				}
-
 			case extensionSignatureAlgorithms:
-				// signature_algorithms - add to ech_outer_extensions
 				echOuterExts = append(echOuterExts, extensionSignatureAlgorithms)
-
 			case utlsExtensionCompressCertificate:
-				// compress_certificate - add to ech_outer_extensions
 				echOuterExts = append(echOuterExts, utlsExtensionCompressCertificate)
-
 			case extensionQUICTransportParameters:
-				// quic_transport_parameters - add to ech_outer_extensions
 				echOuterExts = append(echOuterExts, extensionQUICTransportParameters)
-
 			case extensionKeyShare:
-				// key_share - add to ech_outer_extensions
 				echOuterExts = append(echOuterExts, extensionKeyShare)
+			// Note: server_name and ECH are NOT in ech_outer_extensions (they're in inner directly)
 			}
 		}
 
-		// Add ech_outer_extensions at the end (will be expanded by server in correct positions)
+		// Add ech_outer_extensions - ALWAYS third/last
 		if len(echOuterExts) > 0 {
 			exts.AddUint16(extensionECHOuterExtensions)
 			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
