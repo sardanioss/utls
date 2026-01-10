@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"hash"
 	"net"
+	"os"
 	"slices"
 	"strconv"
 
@@ -543,6 +544,47 @@ func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech
 
 	serializedOuter := uconn.HandshakeState.Hello.Raw
 	serializedOuter = serializedOuter[4:]
+
+	// Debug: print outer hello SNI
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		// Parse the outer hello to find SNI
+		fmt.Printf("[ECH DEBUG] Outer hello length: %d bytes\n", len(serializedOuter))
+		// Skip: version(2) + random(32) + sessionID(var) + cipherSuites(var) + compression(var)
+		if len(serializedOuter) > 38 {
+			offset := 34 // version(2) + random(32)
+			sessionIdLen := int(serializedOuter[offset])
+			offset += 1 + sessionIdLen
+			cipherSuitesLen := int(serializedOuter[offset])<<8 | int(serializedOuter[offset+1])
+			offset += 2 + cipherSuitesLen
+			compressionLen := int(serializedOuter[offset])
+			offset += 1 + compressionLen
+			if offset+2 < len(serializedOuter) {
+				extensionsLen := int(serializedOuter[offset])<<8 | int(serializedOuter[offset+1])
+				offset += 2
+				fmt.Printf("[ECH DEBUG] Outer extensions length: %d\n", extensionsLen)
+				endOffset := offset + extensionsLen
+				for offset+4 <= len(serializedOuter) && offset < endOffset {
+					extType := int(serializedOuter[offset])<<8 | int(serializedOuter[offset+1])
+					extLen := int(serializedOuter[offset+2])<<8 | int(serializedOuter[offset+3])
+					if extType == 0 { // SNI extension
+						if offset+4+extLen <= len(serializedOuter) {
+							// SNI format: list_len(2) + name_type(1) + name_len(2) + name
+							sniListLen := int(serializedOuter[offset+4])<<8 | int(serializedOuter[offset+5])
+							if sniListLen > 0 && offset+8 < len(serializedOuter) {
+								sniNameLen := int(serializedOuter[offset+7])<<8 | int(serializedOuter[offset+8])
+								if offset+9+sniNameLen <= len(serializedOuter) {
+									sniName := string(serializedOuter[offset+9 : offset+9+sniNameLen])
+									fmt.Printf("[ECH DEBUG] Outer SNI in bytes: %s\n", sniName)
+								}
+							}
+						}
+					}
+					offset += 4 + extLen
+				}
+			}
+		}
+	}
+
 	encryptedInner, err := ech.hpkeContext.Seal(serializedOuter, encodedInner)
 	if err != nil {
 		return err
@@ -578,15 +620,9 @@ func (uconn *UConn) MarshalClientHello() error {
 			return err
 		}
 
-		// For ECH inner hello, explicitly clear TLS 1.2 legacy extensions
-		// These should NOT be in the inner hello regardless of QUIC status
-		// Chrome QUIC doesn't use SCT at all
-		inner.scts = false
-		inner.ocspStapling = false
-		inner.extendedMasterSecret = false
-		inner.supportedPoints = nil
-		inner.secureRenegotiationSupported = false
-		inner.ticketSupported = false
+		// Copy cipher suites from outer hello (Chrome fingerprint) to inner hello
+		// This is CRITICAL - inner hello must have same cipher suites as outer for fingerprint matching
+		inner.cipherSuites = uconn.HandshakeState.Hello.CipherSuites
 
 		// copy compressed extensions to the ClientHelloInner
 		// These are extensions that will be referenced via ech_outer_extensions
@@ -614,9 +650,48 @@ func (uconn *UConn) MarshalClientHello() error {
 
 		ech.innerHello = inner
 
+		// Debug: compare inner and outer random values
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG] Inner random: %x\n", inner.random[:8])
+			fmt.Printf("[ECH DEBUG] Outer random: %x\n", uconn.HandshakeState.Hello.Random[:8])
+		}
+
+		// For ECH, the outer hello's SNI must be the ECH public name (from ECH config)
+		// Save the original SNI to restore after ECH computation if needed
+		originalServerName := uconn.config.ServerName
+		publicName := string(ech.config.PublicName)
+
+		// Debug: print SNI change
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG] Updating outer SNI: %s -> %s\n", originalServerName, publicName)
+		}
+
+		// Update outer SNI extension to use the ECH public name
+		uconn.config.ServerName = publicName
+		sniFound := false
+		for _, ext := range uconn.Extensions {
+			if sniExt, ok := ext.(*SNIExtension); ok {
+				sniExt.ServerName = publicName
+				sniFound = true
+				if os.Getenv("UTLS_ECH_DEBUG") != "" {
+					fmt.Printf("[ECH DEBUG] Updated SNIExtension.ServerName to: %s\n", sniExt.ServerName)
+				}
+				break
+			}
+		}
+		if os.Getenv("UTLS_ECH_DEBUG") != "" && !sniFound {
+			fmt.Printf("[ECH DEBUG] WARNING: No SNIExtension found in Extensions!\n")
+		}
+
 		if err := uconn.computeAndUpdateOuterECHExtension(inner, ech, true); err != nil {
+			// Restore original server name on error
+			uconn.config.ServerName = originalServerName
 			return err
 		}
+
+		// Restore original server name for connection state
+		// The outer hello is already serialized with the public name
+		uconn.config.ServerName = originalServerName
 
 		uconn.echCtx = ech
 		return nil

@@ -119,6 +119,7 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 	// 1. ECH inner marker (65037) - ALWAYS first
 	// 2. server_name (0) - ALWAYS second (with real domain)
 	// 3. ech_outer_extensions (64768) - ALWAYS third (references outer extensions)
+	// 4. supported_versions (43) - ALWAYS fourth (TLS 1.3 only)
 	//
 	// The ech_outer_extensions list contains extension IDs in the order they appear
 	// in the outer hello (which may be shuffled), but the inner hello structure is fixed.
@@ -147,7 +148,14 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 
 		// 3. Build ech_outer_extensions list - order follows outer hello
 		// Iterate through outer extensions and add compressible ones to the list
+		// RFC 8446 + ECH spec: Most extensions can be compressed via ech_outer_extensions
+		// Exceptions: server_name (different in inner/outer), encrypted_client_hello, supported_versions
 		for _, extType := range outerExts {
+			// Check for GREASE extension (pattern: extType&0x0f0f == 0x0a0a)
+			if extType&0x0f0f == 0x0a0a {
+				echOuterExts = append(echOuterExts, extType)
+				continue
+			}
 			switch extType {
 			case utlsExtensionApplicationSettingsNew, utlsExtensionApplicationSettings:
 				if slices.Contains(outerExts, utlsExtensionApplicationSettingsNew) {
@@ -161,8 +169,6 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 				echOuterExts = append(echOuterExts, extensionSupportedCurves)
 			case extensionALPN:
 				echOuterExts = append(echOuterExts, extensionALPN)
-			case extensionSupportedVersions:
-				echOuterExts = append(echOuterExts, extensionSupportedVersions)
 			case extensionSignatureAlgorithms:
 				echOuterExts = append(echOuterExts, extensionSignatureAlgorithms)
 			case utlsExtensionCompressCertificate:
@@ -171,11 +177,27 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 				echOuterExts = append(echOuterExts, extensionQUICTransportParameters)
 			case extensionKeyShare:
 				echOuterExts = append(echOuterExts, extensionKeyShare)
-			// Note: server_name and ECH are NOT in ech_outer_extensions (they're in inner directly)
+			// Additional extensions for Chrome fingerprint matching
+			case extensionRenegotiationInfo:
+				echOuterExts = append(echOuterExts, extensionRenegotiationInfo)
+			case extensionSCT:
+				echOuterExts = append(echOuterExts, extensionSCT)
+			case extensionSupportedPoints:
+				echOuterExts = append(echOuterExts, extensionSupportedPoints)
+			case extensionSessionTicket:
+				echOuterExts = append(echOuterExts, extensionSessionTicket)
+			case extensionStatusRequest:
+				echOuterExts = append(echOuterExts, extensionStatusRequest)
+			case extensionExtendedMasterSecret:
+				echOuterExts = append(echOuterExts, extensionExtendedMasterSecret)
+			case extensionSignatureAlgorithmsCert:
+				echOuterExts = append(echOuterExts, extensionSignatureAlgorithmsCert)
+			// Note: server_name (different SNI), encrypted_client_hello, and supported_versions
+			// are NOT in ech_outer_extensions - they're serialized directly in inner hello
 			}
 		}
 
-		// Add ech_outer_extensions - ALWAYS third/last
+		// Add ech_outer_extensions - ALWAYS third
 		if len(echOuterExts) > 0 {
 			exts.AddUint16(extensionECHOuterExtensions)
 			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
@@ -185,6 +207,28 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 					}
 				})
 			})
+		}
+
+		// 4. Add supported_versions inline (NOT via ech_outer_extensions)
+		// ECH inner must be TLS 1.3 only, filter out TLS 1.2 and older
+		if len(m.supportedVersions) > 0 {
+			var tls13Versions []uint16
+			for _, vers := range m.supportedVersions {
+				// Keep GREASE and TLS 1.3 only
+				if vers == VersionTLS13 || vers&0x0f0f == 0x0a0a {
+					tls13Versions = append(tls13Versions, vers)
+				}
+			}
+			if len(tls13Versions) > 0 {
+				exts.AddUint16(extensionSupportedVersions)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+						for _, vers := range tls13Versions {
+							exts.AddUint16(vers)
+						}
+					})
+				})
+			}
 		}
 
 		// Build the rest of the ClientHello
@@ -347,8 +391,28 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 	}
 	if len(m.supportedVersions) > 0 {
 		// RFC 8446, Section 4.2.1
+		// For ECH inner hello, supported_versions MUST only contain TLS 1.3
+		// (ECH is TLS 1.3 only). We serialize it inline, NOT via ech_outer_extensions,
+		// because the outer hello may contain TLS 1.2 for backwards compatibility.
 		if echInner {
-			echOuterExts = append(echOuterExts, extensionSupportedVersions)
+			// ECH inner: serialize inline with only TLS 1.3 (filter out TLS 1.2 and older)
+			var tls13Versions []uint16
+			for _, vers := range m.supportedVersions {
+				// Keep GREASE and TLS 1.3 only
+				if vers == VersionTLS13 || vers&0x0f0f == 0x0a0a {
+					tls13Versions = append(tls13Versions, vers)
+				}
+			}
+			if len(tls13Versions) > 0 {
+				exts.AddUint16(extensionSupportedVersions)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+						for _, vers := range tls13Versions {
+							exts.AddUint16(vers)
+						}
+					})
+				})
+			}
 		} else {
 			exts.AddUint16(extensionSupportedVersions)
 			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
