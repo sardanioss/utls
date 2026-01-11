@@ -150,12 +150,12 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 		// Iterate through outer extensions and add compressible ones to the list
 		// RFC 8446 + ECH spec: Most extensions can be compressed via ech_outer_extensions
 		// Exceptions: server_name (different in inner/outer), encrypted_client_hello, supported_versions
-		// Note: GREASE extensions are NOT included in ech_outer_extensions because:
-		// 1. GREASE is for outer hello fingerprinting, not needed in inner hello
-		// 2. Including GREASE would require passing raw bytes for binder calculation
+		// Note: GREASE extensions ARE included in ech_outer_extensions so the expanded inner hello
+		// matches Chrome's fingerprint (Chrome includes GREASE at start and end of extensions)
 		for _, extType := range outerExts {
-			// Skip GREASE extensions (pattern: extType&0x0f0f == 0x0a0a)
+			// Include GREASE extensions (pattern: extType&0x0f0f == 0x0a0a)
 			if extType&0x0f0f == 0x0a0a {
+				echOuterExts = append(echOuterExts, extType)
 				continue
 			}
 			switch extType {
@@ -173,9 +173,8 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 				echOuterExts = append(echOuterExts, extensionALPN)
 			case extensionSignatureAlgorithms:
 				echOuterExts = append(echOuterExts, extensionSignatureAlgorithms)
-			// Note: utlsExtensionCompressCertificate is NOT added to ech_outer_extensions
-			// because clientHelloMsg doesn't store compress_certificate data.
-			// The extension will be in outer hello only, not expanded into inner.
+			case utlsExtensionCompressCertificate:
+				echOuterExts = append(echOuterExts, utlsExtensionCompressCertificate)
 			case extensionQUICTransportParameters:
 				echOuterExts = append(echOuterExts, extensionQUICTransportParameters)
 			case extensionKeyShare:
@@ -533,7 +532,15 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 			extensionSupportedVersions,            // 43
 			extensionPSKModes,                     // 45
 			extensionSupportedCurves,              // 10 (supported_groups)
-			extensionQUICTransportParameters,      // 57 (LAST)
+			extensionQUICTransportParameters,      // 57
+			// HTTP/2 (TCP) specific extensions - must be included for proper fingerprinting
+			extensionStatusRequest,                // 5 (OCSP stapling)
+			extensionSupportedPoints,              // 11 (EC point formats)
+			extensionSCT,                          // 18 (signed certificate timestamp)
+			extensionExtendedMasterSecret,         // 23
+			extensionSessionTicket,                // 35
+			extensionSignatureAlgorithmsCert,      // 50
+			extensionRenegotiationInfo,            // 65281
 		}
 		echOuterExtsReordered := slices.Collect(func(yield func(uint16) bool) {
 			for _, ext := range chromeECHOuterOrder {
@@ -715,11 +722,21 @@ func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16) ([]byte, error) 
 
 	// 3. Extensions in outer hello order (these would have been in ech_outer_extensions)
 	// Iterate through outer extensions and add the ones that are compressible
+	greaseCount := 0
 	for _, extType := range outerExts {
-		// Check for GREASE extension (pattern: extType&0x0f0f == 0x0a0a)
+		// Handle GREASE extensions (pattern: extType&0x0f0f == 0x0a0a)
+		// Chrome includes GREASE at start (empty body) and end (0x00 body) of extensions
 		if extType&0x0f0f == 0x0a0a {
-			// GREASE extensions are not expanded - they were just references
-			// Skip GREASE in expanded format as server doesn't include them
+			exts.AddUint16(extType)
+			if greaseCount == 0 {
+				// First GREASE: empty body
+				exts.AddUint16(0) // length = 0
+			} else {
+				// Second GREASE: single zero byte
+				exts.AddUint16(1)  // length = 1
+				exts.AddUint8(0)   // data = 0x00
+			}
+			greaseCount++
 			continue
 		}
 		switch extType {
