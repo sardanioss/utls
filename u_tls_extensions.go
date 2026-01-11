@@ -1967,6 +1967,7 @@ func (e *FakeDelegatedCredentialsExtension) UnmarshalJSON(data []byte) error {
 type FakeEarlyDataExtension struct{}
 
 func (e *FakeEarlyDataExtension) writeToUConn(uc *UConn) error {
+	uc.HandshakeState.Hello.EarlyData = true
 	return nil
 }
 

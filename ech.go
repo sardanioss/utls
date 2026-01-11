@@ -228,6 +228,8 @@ func encodeInnerClientHelloReorderOuterExts(inner *clientHelloMsg, maxNameLength
 			fmt.Printf("    keyShare[%d]: group=%d, data_len=%d\n", i, ks.group, len(ks.data))
 		}
 		fmt.Printf("  pskModes len: %d\n", len(inner.pskModes))
+		fmt.Printf("  pskIdentities len: %d\n", len(inner.pskIdentities))
+		fmt.Printf("  pskBinders len: %d\n", len(inner.pskBinders))
 		fmt.Printf("  supportedCurves len: %d\n", len(inner.supportedCurves))
 		fmt.Printf("  supportedVersions len: %d\n", len(inner.supportedVersions))
 		fmt.Printf("  alpnProtocols: %v\n", inner.alpnProtocols)

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
@@ -457,6 +458,11 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	// [uTLS] If session is nil but earlyData was set (e.g., by FakeEarlyDataExtension),
+	// we must clear it since 0-RTT requires a valid session
+	if session == nil && hello.earlyData {
+		hello.earlyData = false
+	}
 	if session != nil {
 		defer func() {
 			// If we got a handshake failure when resuming a session, throw away
@@ -586,9 +592,23 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 func (c *UConn) echTranscriptMsg(outer *clientHelloMsg, echCtx *echClientContext) (err error) {
 	// Recreate the inner ClientHello from its compressed form using server's decodeInnerClientHello function.
 	// See https://github.com/sardanioss/utls/blob/e430876b1d82fdf582efc57f3992d448e7ab3d8a/ech.go#L276-L283
+
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		fmt.Printf("[ECH DEBUG] === echTranscriptMsg ===\n")
+		fmt.Printf("[ECH DEBUG]   extensionsList: %v\n", c.extensionsList())
+		fmt.Printf("[ECH DEBUG]   inner.serverName: %s\n", echCtx.innerHello.serverName)
+	}
+
 	encodedInner, err := encodeInnerClientHelloReorderOuterExts(echCtx.innerHello, int(echCtx.config.MaxNameLength), c.extensionsList())
 	if err != nil {
 		return err
+	}
+
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		fmt.Printf("[ECH DEBUG]   echTranscriptMsg encodedInner length: %d\n", len(encodedInner))
+		if len(encodedInner) > 32 {
+			fmt.Printf("[ECH DEBUG]   echTranscriptMsg encodedInner (first 32): %x\n", encodedInner[:32])
+		}
 	}
 
 	decodedInner, err := decodeInnerClientHello(outer, encodedInner)

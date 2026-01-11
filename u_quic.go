@@ -156,6 +156,25 @@ func (q *UQUICConn) ConnectionState() ConnectionState {
 	return q.conn.ConnectionState()
 }
 
+// StoreSession stores a session previously received in a QUICStoreSession event
+// in the ClientSessionCache.
+func (q *UQUICConn) StoreSession(session *SessionState) error {
+	c := q.conn.Conn
+	if !c.isClient {
+		return quicError(errors.New("tls: StoreSessionTicket called on the server"))
+	}
+	cacheKey := c.clientSessionCacheKey()
+	if cacheKey == "" {
+		return nil
+	}
+	if c.config.ClientSessionCache == nil {
+		return nil
+	}
+	cs := &ClientSessionState{session: session}
+	c.config.ClientSessionCache.Put(cacheKey, cs)
+	return nil
+}
+
 // SetTransportParameters sets the transport parameters to send to the peer.
 //
 // Server connections may delay setting the transport parameters until after
