@@ -285,6 +285,9 @@ func (s *sessionController) syncSessionExts() error {
 			uAssert(i == len(s.uconnRef.Extensions)-1, "tls: checkSessionExts failed: PreSharedKeyExtension must be the last extension")
 			if s.pskExtension == nil {
 				// If there isn't a user-provided psk extension, use the one from the spec
+				// Reset it first in case it was initialized from a previous connection
+				// (this happens when reusing a cached ClientHelloSpec)
+				ext.ResetForReuse()
 				s.pskExtension = ext
 			} else {
 				// Otherwise, replace the one in the extension list with the user-provided one

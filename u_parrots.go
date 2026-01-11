@@ -1576,7 +1576,8 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			}),
 		}, nil
 
-	// Chrome 143 QUIC with PSK for session resumption
+	// Chrome 143 QUIC with PSK for session resumption (0-RTT)
+	// Real Chrome sends 13 extensions: early_data first, PSK last, rest shuffled
 	case HelloChrome_143_QUIC_PSK:
 		return ClientHelloSpec{
 			CipherSuites: []uint16{
@@ -1587,8 +1588,12 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			CompressionMethods: []byte{
 				0x00, // compressionNone
 			},
-			// Chrome QUIC extension order with shuffling + PSK at end (Chrome shuffles since v110)
+			// Chrome QUIC extension order for resumed connections:
+			// - early_data (42) at start for 0-RTT indication
+			// - Shuffled middle extensions
+			// - pre_shared_key (41) must be last per RFC 8446
 			Extensions: ShuffleChromeTLSExtensions([]TLSExtension{
+				&FakeEarlyDataExtension{},                            // early_data (42) - 0-RTT indicator
 				&ApplicationSettingsExtensionNew{SupportedProtocols: []string{"h3"}},
 				BoringGREASEECH(),
 				&ALPNExtension{AlpnProtocols: []string{"h3"}},
@@ -3597,9 +3602,9 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 					}
 					continue
 				}
-				if len(ext.KeyShares[i].Data) > 1 {
-					continue
-				}
+				// Always regenerate keys for non-GREASE curves (clear existing data)
+				// This ensures fresh keys for each connection when spec is reused
+				ext.KeyShares[i].Data = nil
 
 				if curveID == X25519MLKEM768 || curveID == X25519Kyber768Draft00 {
 					ecdheKey, err := generateECDHEKey(uconn.config.rand(), X25519)

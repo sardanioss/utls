@@ -88,6 +88,10 @@ type PreSharedKeyExtension interface {
 	// Its purpose is to update the binders of PSK (Pre-Shared Key) identities.
 	PatchBuiltHello(hello *PubClientHelloMsg) error
 
+	// ResetForReuse resets the extension state so it can be reused for a new connection.
+	// This is called when a cached ClientHelloSpec is used for a new connection.
+	ResetForReuse()
+
 	mustEmbedUnimplementedPreSharedKeyExtension() // this works like a type guard
 }
 
@@ -127,6 +131,10 @@ func (*UnimplementedPreSharedKeyExtension) SetOmitEmptyPsk(val bool) {
 	panic("tls: SetOmitEmptyPsk is not implemented for the PreSharedKeyExtension")
 }
 
+func (*UnimplementedPreSharedKeyExtension) ResetForReuse() {
+	panic("tls: ResetForReuse is not implemented for the PreSharedKeyExtension")
+}
+
 // UtlsPreSharedKeyExtension is an extension used to set the PSK extension in the
 // ClientHello.
 type UtlsPreSharedKeyExtension struct {
@@ -152,6 +160,16 @@ func (e *UtlsPreSharedKeyExtension) InitializeByUtls(session *SessionState, earl
 	for i := 0; i < len(e.Identities); i++ {
 		e.Binders = append(e.Binders, make([]byte, e.cipherSuite.hash.Size()))
 	}
+}
+
+func (e *UtlsPreSharedKeyExtension) ResetForReuse() {
+	e.Session = nil
+	e.EarlySecret = nil
+	e.BinderKey = nil
+	e.Identities = nil
+	e.Binders = nil
+	e.cipherSuite = nil
+	e.cachedLength = nil
 }
 
 func (e *UtlsPreSharedKeyExtension) writeToUConn(uc *UConn) error {
@@ -181,7 +199,9 @@ func pskExtLen(identities []PskIdentity, binders [][]byte) int {
 }
 
 func (e *UtlsPreSharedKeyExtension) Len() int {
-	if e.Session == nil {
+	// Support GREASE PSK: Identities/Binders can be set directly without Session
+	// Only return 0 if BOTH Session is nil AND Identities/Binders are empty
+	if e.Session == nil && (len(e.Identities) == 0 || len(e.Binders) == 0) {
 		return 0
 	}
 	if e.cachedLength != nil {
@@ -336,6 +356,11 @@ func (e *FakePreSharedKeyExtension) IsInitialized() bool {
 
 func (e *FakePreSharedKeyExtension) InitializeByUtls(session *SessionState, earlySecret []byte, binderKey []byte, identities []PskIdentity) {
 	panic("InitializeByUtls failed: don't let utls initialize FakePreSharedKeyExtension; provide your own identities and binders or use UtlsPreSharedKeyExtension")
+}
+
+func (e *FakePreSharedKeyExtension) ResetForReuse() {
+	e.Identities = nil
+	e.Binders = nil
 }
 
 func (e *FakePreSharedKeyExtension) writeToUConn(uc *UConn) error {

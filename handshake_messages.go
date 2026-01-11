@@ -150,10 +150,12 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 		// Iterate through outer extensions and add compressible ones to the list
 		// RFC 8446 + ECH spec: Most extensions can be compressed via ech_outer_extensions
 		// Exceptions: server_name (different in inner/outer), encrypted_client_hello, supported_versions
+		// Note: GREASE extensions are NOT included in ech_outer_extensions because:
+		// 1. GREASE is for outer hello fingerprinting, not needed in inner hello
+		// 2. Including GREASE would require passing raw bytes for binder calculation
 		for _, extType := range outerExts {
-			// Check for GREASE extension (pattern: extType&0x0f0f == 0x0a0a)
+			// Skip GREASE extensions (pattern: extType&0x0f0f == 0x0a0a)
 			if extType&0x0f0f == 0x0a0a {
-				echOuterExts = append(echOuterExts, extType)
 				continue
 			}
 			switch extType {
@@ -171,8 +173,9 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 				echOuterExts = append(echOuterExts, extensionALPN)
 			case extensionSignatureAlgorithms:
 				echOuterExts = append(echOuterExts, extensionSignatureAlgorithms)
-			case utlsExtensionCompressCertificate:
-				echOuterExts = append(echOuterExts, utlsExtensionCompressCertificate)
+			// Note: utlsExtensionCompressCertificate is NOT added to ech_outer_extensions
+			// because clientHelloMsg doesn't store compress_certificate data.
+			// The extension will be in outer hello only, not expanded into inner.
 			case extensionQUICTransportParameters:
 				echOuterExts = append(echOuterExts, extensionQUICTransportParameters)
 			case extensionKeyShare:
@@ -229,6 +232,36 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 					})
 				})
 			}
+		}
+
+		// 5. Add early_data if present (for 0-RTT with ECH)
+		// Per ECH spec: early_data MUST be in inner hello, NOT in outer hello
+		if m.earlyData {
+			exts.AddUint16(extensionEarlyData)
+			exts.AddUint16(0) // empty extension_data
+		}
+
+		// 6. Add pre_shared_key if present - MUST be last extension (RFC 8446)
+		// For ECH, PSK must be in the inner ClientHello with binders calculated over inner hello
+		if len(m.pskIdentities) > 0 {
+			exts.AddUint16(extensionPreSharedKey)
+			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					for _, psk := range m.pskIdentities {
+						exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+							exts.AddBytes(psk.label)
+						})
+						exts.AddUint32(psk.obfuscatedTicketAge)
+					}
+				})
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					for _, binder := range m.pskBinders {
+						exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+							exts.AddBytes(binder)
+						})
+					}
+				})
+			})
 		}
 
 		// Build the rest of the ClientHello
@@ -612,6 +645,309 @@ func (m *clientHelloMsg) marshalWithoutBinders() ([]byte, error) {
 		}
 	}
 	return fullMessage[:len(fullMessage)-bindersLen], nil
+}
+
+// marshalWithoutBindersECH returns the ECH inner ClientHello without binders.
+// This uses the ECH inner format with ech_outer_extensions compression.
+// The outerExts parameter specifies which extensions to reference from outer hello.
+// Note: This includes the 4-byte message header (type + length) for transcript calculation.
+func (m *clientHelloMsg) marshalWithoutBindersECH(outerExts []uint16) ([]byte, error) {
+	bindersLen := 2 // uint16 length prefix
+	for _, binder := range m.pskBinders {
+		bindersLen += 1 // uint8 length prefix
+		bindersLen += len(binder)
+	}
+
+	fullMessage, err := m.marshalMsgReorderOuterExts(true, outerExts)
+	if err != nil {
+		return nil, err
+	}
+	// Keep the header, only strip binders from the end (same as marshalWithoutBinders)
+	return fullMessage[:len(fullMessage)-bindersLen], nil
+}
+
+// marshalExpandedECHWithoutBinders returns the EXPANDED inner ClientHello without binders.
+// This produces the format that results after the server expands ech_outer_extensions.
+// This is needed for PSK binder calculation with ECH, as the server verifies binders
+// over the expanded (reconstructed) ClientHelloInner, not the compressed format.
+// The outerExts parameter specifies the extension order from the outer hello.
+func (m *clientHelloMsg) marshalExpandedECHWithoutBinders(outerExts []uint16) ([]byte, error) {
+	bindersLen := 2 // uint16 length prefix
+	for _, binder := range m.pskBinders {
+		bindersLen += 1 // uint8 length prefix
+		bindersLen += len(binder)
+	}
+
+	fullMessage, err := m.marshalExpandedECH(outerExts)
+	if err != nil {
+		return nil, err
+	}
+	// Strip binders from the end
+	return fullMessage[:len(fullMessage)-bindersLen], nil
+}
+
+// marshalExpandedECH marshals the inner ClientHello in the format that results
+// after the server expands ech_outer_extensions references.
+// Extension order: ECH inner marker, server_name, [outer ext order], supported_versions, PSK
+func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16) ([]byte, error) {
+	var exts cryptobyte.Builder
+
+	// 1. ECH inner marker - ALWAYS first (same as compressed format)
+	if len(m.encryptedClientHello) > 0 {
+		exts.AddUint16(extensionEncryptedClientHello)
+		exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+			exts.AddBytes(m.encryptedClientHello)
+		})
+	}
+
+	// 2. server_name - ALWAYS second (with real domain)
+	if len(m.serverName) > 0 {
+		exts.AddUint16(extensionServerName)
+		exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+				exts.AddUint8(0) // name_type = host_name
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddBytes([]byte(m.serverName))
+				})
+			})
+		})
+	}
+
+	// 3. Extensions in outer hello order (these would have been in ech_outer_extensions)
+	// Iterate through outer extensions and add the ones that are compressible
+	for _, extType := range outerExts {
+		// Check for GREASE extension (pattern: extType&0x0f0f == 0x0a0a)
+		if extType&0x0f0f == 0x0a0a {
+			// GREASE extensions are not expanded - they were just references
+			// Skip GREASE in expanded format as server doesn't include them
+			continue
+		}
+		switch extType {
+		case extensionServerName, extensionEncryptedClientHello, extensionSupportedVersions, extensionPreSharedKey:
+			// These are NOT compressed via ech_outer_extensions
+			continue
+		case extensionPSKModes:
+			if len(m.pskModes) > 0 {
+				exts.AddUint16(extensionPSKModes)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddBytes(m.pskModes)
+					})
+				})
+			}
+		case extensionSupportedCurves:
+			if len(m.supportedCurves) > 0 {
+				exts.AddUint16(extensionSupportedCurves)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						for _, curve := range m.supportedCurves {
+							exts.AddUint16(uint16(curve))
+						}
+					})
+				})
+			}
+		case extensionALPN:
+			if len(m.alpnProtocols) > 0 {
+				exts.AddUint16(extensionALPN)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						for _, proto := range m.alpnProtocols {
+							exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+								exts.AddBytes([]byte(proto))
+							})
+						}
+					})
+				})
+			}
+		case extensionSignatureAlgorithms:
+			if len(m.supportedSignatureAlgorithms) > 0 {
+				exts.AddUint16(extensionSignatureAlgorithms)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						for _, sigAlgo := range m.supportedSignatureAlgorithms {
+							exts.AddUint16(uint16(sigAlgo))
+						}
+					})
+				})
+			}
+		case extensionSignatureAlgorithmsCert:
+			if len(m.supportedSignatureAlgorithmsCert) > 0 {
+				exts.AddUint16(extensionSignatureAlgorithmsCert)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						for _, sigAlgo := range m.supportedSignatureAlgorithmsCert {
+							exts.AddUint16(uint16(sigAlgo))
+						}
+					})
+				})
+			}
+		case extensionKeyShare:
+			if len(m.keyShares) > 0 {
+				exts.AddUint16(extensionKeyShare)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						for _, ks := range m.keyShares {
+							exts.AddUint16(uint16(ks.group))
+							exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+								exts.AddBytes(ks.data)
+							})
+						}
+					})
+				})
+			}
+		case extensionQUICTransportParameters:
+			if len(m.quicTransportParameters) > 0 {
+				exts.AddUint16(extensionQUICTransportParameters)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddBytes(m.quicTransportParameters)
+				})
+			}
+		// Note: utlsExtensionCompressCertificate is NOT handled here because
+		// clientHelloMsg doesn't store compress_certificate data.
+		// This extension should be removed from ech_outer_extensions.
+		case extensionRenegotiationInfo:
+			if m.secureRenegotiationSupported {
+				exts.AddUint16(extensionRenegotiationInfo)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddBytes(m.secureRenegotiation)
+					})
+				})
+			}
+		case extensionSCT:
+			if m.scts {
+				exts.AddUint16(extensionSCT)
+				exts.AddUint16(0) // empty extension_data
+			}
+		case extensionSupportedPoints:
+			if len(m.supportedPoints) > 0 {
+				exts.AddUint16(extensionSupportedPoints)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddBytes(m.supportedPoints)
+					})
+				})
+			}
+		case extensionSessionTicket:
+			if m.ticketSupported {
+				exts.AddUint16(extensionSessionTicket)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddBytes(m.sessionTicket)
+				})
+			}
+		case extensionStatusRequest:
+			if m.ocspStapling {
+				exts.AddUint16(extensionStatusRequest)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint8(1) // status_type = ocsp
+					exts.AddUint16(0) // responder_id_list (empty)
+					exts.AddUint16(0) // request_extensions (empty)
+				})
+			}
+		case extensionExtendedMasterSecret:
+			if m.extendedMasterSecret {
+				exts.AddUint16(extensionExtendedMasterSecret)
+				exts.AddUint16(0) // empty extension_data
+			}
+		case utlsExtensionApplicationSettings, utlsExtensionApplicationSettingsNew:
+			if len(m.alpnProtocols) > 0 {
+				exts.AddUint16(extType)
+				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						for _, proto := range m.alpnProtocols {
+							exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+								exts.AddBytes([]byte(proto))
+							})
+						}
+					})
+				})
+			}
+		// Note: extensionEarlyData is handled inline below, not via ech_outer_extensions
+		// since early_data must be in inner hello only (not in outer hello)
+		}
+	}
+
+	// 4. supported_versions - always inline (not via ech_outer_extensions)
+	if len(m.supportedVersions) > 0 {
+		var tls13Versions []uint16
+		for _, vers := range m.supportedVersions {
+			// Keep GREASE and TLS 1.3 only for ECH inner
+			if vers == VersionTLS13 || vers&0x0f0f == 0x0a0a {
+				tls13Versions = append(tls13Versions, vers)
+			}
+		}
+		if len(tls13Versions) > 0 {
+			exts.AddUint16(extensionSupportedVersions)
+			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+				exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+					for _, vers := range tls13Versions {
+						exts.AddUint16(vers)
+					}
+				})
+			})
+		}
+	}
+
+	// 5. early_data - inline (not via ech_outer_extensions)
+	// Per ECH spec: early_data MUST be in inner hello, NOT in outer hello
+	if m.earlyData {
+		exts.AddUint16(extensionEarlyData)
+		exts.AddUint16(0) // empty extension_data
+	}
+
+	// 6. pre_shared_key - MUST be last extension (RFC 8446)
+	if len(m.pskIdentities) > 0 {
+		exts.AddUint16(extensionPreSharedKey)
+		exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+				for _, psk := range m.pskIdentities {
+					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddBytes(psk.label)
+					})
+					exts.AddUint32(psk.obfuscatedTicketAge)
+				}
+			})
+			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+				for _, binder := range m.pskBinders {
+					exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+						exts.AddBytes(binder)
+					})
+				}
+			})
+		})
+	}
+
+	extBytes, err := exts.Bytes()
+	if err != nil {
+		return nil, err
+	}
+
+	// Build the full ClientHello
+	var b cryptobyte.Builder
+	b.AddUint8(typeClientHello)
+	b.AddUint24LengthPrefixed(func(b *cryptobyte.Builder) {
+		b.AddUint16(VersionTLS12) // legacy_version
+		b.AddBytes(m.random[:])
+		b.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {
+			// For ECH inner, session_id should be empty (per spec)
+			// but we follow what the compressed format uses
+		})
+		b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
+			for _, suite := range m.cipherSuites {
+				b.AddUint16(suite)
+			}
+		})
+		b.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {
+			b.AddBytes(m.compressionMethods)
+		})
+		if len(extBytes) > 0 {
+			b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
+				b.AddBytes(extBytes)
+			})
+		}
+	})
+
+	return b.Bytes()
 }
 
 // updateBinders updates the m.pskBinders field. The supplied binders must have
