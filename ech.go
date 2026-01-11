@@ -506,7 +506,17 @@ func computeAndUpdateOuterECHExtension(outer, inner *clientHelloMsg, ech *echCli
 	if useKey {
 		encapKey = ech.encapsulatedKey
 	}
-	encodedInner, err := encodeInnerClientHello(inner, int(ech.config.MaxNameLength))
+
+	// [uTLS SECTION BEGIN]
+	// First, marshal the outer hello to get extension list for proper inner hello building
+	// This ensures ech_outer_extensions includes all extensions like compress_certificate
+	tempOuter, err := outer.marshal()
+	if err != nil {
+		return err
+	}
+	outerExts := extractExtensionTypes(tempOuter[4:]) // skip 4-byte header
+	encodedInner, err := encodeInnerClientHelloReorderOuterExts(inner, int(ech.config.MaxNameLength), outerExts)
+	// [uTLS SECTION END]
 	if err != nil {
 		return err
 	}
@@ -533,6 +543,51 @@ func computeAndUpdateOuterECHExtension(outer, inner *clientHelloMsg, ech *echCli
 	}
 	return nil
 }
+
+// [uTLS SECTION BEGIN]
+// extractExtensionTypes parses a ClientHello and returns the list of extension types
+func extractExtensionTypes(hello []byte) []uint16 {
+	if len(hello) < 38 { // minimum: version(2) + random(32) + sessionID_len(1) + cipher_len(2) + comp_len(1)
+		return nil
+	}
+	offset := 34 // version(2) + random(32)
+
+	// Skip session ID
+	sessionIDLen := int(hello[offset])
+	offset += 1 + sessionIDLen
+	if offset+2 > len(hello) {
+		return nil
+	}
+
+	// Skip cipher suites
+	cipherLen := int(hello[offset])<<8 | int(hello[offset+1])
+	offset += 2 + cipherLen
+	if offset+1 > len(hello) {
+		return nil
+	}
+
+	// Skip compression methods
+	compLen := int(hello[offset])
+	offset += 1 + compLen
+	if offset+2 > len(hello) {
+		return nil
+	}
+
+	// Parse extensions
+	extLen := int(hello[offset])<<8 | int(hello[offset+1])
+	offset += 2
+	endOffset := offset + extLen
+
+	var exts []uint16
+	for offset+4 <= len(hello) && offset < endOffset {
+		extType := uint16(hello[offset])<<8 | uint16(hello[offset+1])
+		extDataLen := int(hello[offset+2])<<8 | int(hello[offset+3])
+		exts = append(exts, extType)
+		offset += 4 + extDataLen
+	}
+	return exts
+}
+// [uTLS SECTION END]
 
 // validDNSName is a rather rudimentary check for the validity of a DNS name.
 // This is used to check if the public_name in a ECHConfig is valid when we are
