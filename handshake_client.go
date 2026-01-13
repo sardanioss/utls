@@ -281,6 +281,10 @@ type echClientContext struct {
 	// that were actually sent to the server. This is used in echTranscriptMsg to
 	// ensure we decode the exact same bytes the server received.
 	encodedInnerHello []byte
+	// pskInOuterOnly indicates Chrome-style PSK handling: real PSK is in outer hello only,
+	// not encrypted inside ECH. In this case, ECH rejection is expected and should not
+	// cause an error - the server uses outer hello's PSK directly for session resumption.
+	pskInOuterOnly bool
 }
 
 func (c *Conn) clientHandshake(ctx context.Context) (err error) {

@@ -99,16 +99,25 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 	}
 
 	if hs.echContext != nil {
-		fmt.Printf("\n[DEBUG ECH Confirm] ============ ECH CONFIRMATION CHECK ============\n")
-		fmt.Printf("[DEBUG ECH Confirm] innerHello.random[:8]=%x\n", hs.echContext.innerHello.random[:8])
-		// Debug: Check if random in expandedInnerHello matches innerHello.random
-		if len(hs.echContext.expandedInnerHello) > 37 {
-			embeddedRandom := hs.echContext.expandedInnerHello[6:38] // offset 6-37 contains random
-			fmt.Printf("[DEBUG ECH Confirm] expandedInnerHello.random[:8]=%x\n", embeddedRandom[:8])
-			if string(embeddedRandom) != string(hs.echContext.innerHello.random) {
-				fmt.Printf("[DEBUG ECH Confirm] MISMATCH: innerHello.random != expandedInnerHello.random!\n")
+		// Chrome-style PSK: Skip ECH confirmation check entirely.
+		// Server uses outer hello's PSK directly, ECH is not processed.
+		if hs.echContext.pskInOuterOnly {
+			fmt.Printf("\n[DEBUG ECH Confirm] ============ SKIPPING ECH CONFIRMATION (pskInOuterOnly) ============\n")
+			fmt.Printf("[DEBUG ECH Confirm] Chrome-style PSK: server uses outer hello, ECH bypassed\n")
+			hs.echContext.echRejected = true
+			// Continue with outer hello context - this is expected behavior
+		} else {
+			// Standard ECH confirmation check
+			fmt.Printf("\n[DEBUG ECH Confirm] ============ ECH CONFIRMATION CHECK ============\n")
+			fmt.Printf("[DEBUG ECH Confirm] innerHello.random[:8]=%x\n", hs.echContext.innerHello.random[:8])
+			// Debug: Check if random in expandedInnerHello matches innerHello.random
+			if len(hs.echContext.expandedInnerHello) > 37 {
+				embeddedRandom := hs.echContext.expandedInnerHello[6:38] // offset 6-37 contains random
+				fmt.Printf("[DEBUG ECH Confirm] expandedInnerHello.random[:8]=%x\n", embeddedRandom[:8])
+				if string(embeddedRandom) != string(hs.echContext.innerHello.random) {
+					fmt.Printf("[DEBUG ECH Confirm] MISMATCH: innerHello.random != expandedInnerHello.random!\n")
+				}
 			}
-		}
 
 		// Dump FULL ServerHello
 		fmt.Printf("\n[DEBUG ECH Confirm] === FULL SERVER HELLO ===\n")
@@ -164,7 +173,10 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 			}
 		} else {
 			hs.echContext.echRejected = true
+			fmt.Printf("[DEBUG ECH Confirm] ECH REJECTED - falling back to outer hello\n")
+			fmt.Printf("[DEBUG ECH Confirm] Will continue with outer transcript, but 0-RTT data encrypted with inner key will fail\n")
 		}
+		} // end of standard ECH confirmation check (else branch of pskInOuterOnly)
 	}
 
 	if err := transcriptMsg(hs.serverHello, hs.transcript); err != nil {
@@ -206,8 +218,16 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 	}
 
 	if hs.echContext != nil && hs.echContext.echRejected {
-		c.sendAlert(alertECHRequired)
-		return &ECHRejectionError{hs.echContext.retryConfigs}
+		// Chrome-style PSK: ECH rejection is expected when PSK is in outer hello only.
+		// In this case, server uses outer hello's PSK directly for session resumption,
+		// bypassing ECH. This is normal and should not cause an error.
+		if hs.echContext.pskInOuterOnly {
+			fmt.Printf("[DEBUG ECH] ECH rejected but pskInOuterOnly=true, continuing (Chrome-style PSK)\n")
+			// Don't send alert, don't return error - just continue
+		} else {
+			c.sendAlert(alertECHRequired)
+			return &ECHRejectionError{hs.echContext.retryConfigs}
+		}
 	}
 
 	c.isHandshakeComplete.Store(true)

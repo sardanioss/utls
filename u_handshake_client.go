@@ -565,6 +565,7 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		}
 
 		earlyTrafficSecret := earlySecret.ClientEarlyTrafficSecret(transcript)
+		fmt.Printf("[DEBUG ECH+PSK] Early traffic transcript hash: %x\n", transcript.Sum(nil)[:16])
 		fmt.Printf("[DEBUG ECH+PSK] Calling quicSetWriteSecret for early data...\n")
 		c.quicSetWriteSecret(QUICEncryptionLevelEarly, suite.id, earlyTrafficSecret)
 		fmt.Printf("[DEBUG ECH+PSK] Early traffic secret set successfully\n")
@@ -656,85 +657,12 @@ func (c *UConn) echTranscriptMsg(outer *clientHelloMsg, echCtx *echClientContext
 	fmt.Printf("[ECH DEBUG] === echTranscriptMsg ===\n")
 	fmt.Printf("[ECH DEBUG]   expandedInnerHello len: %d\n", len(echCtx.expandedInnerHello))
 
-	// PSK case: Try using decode path instead of expandedInnerHello to see if it works
-	// EXPERIMENT: Bypass expandedInnerHello and use decode path
-	if len(echCtx.expandedInnerHello) > 0 && len(echCtx.encodedInnerHello) > 0 {
-		fmt.Printf("[ECH DEBUG]   PSK case - EXPERIMENT: Using decode path instead of expandedInnerHello\n")
-		fmt.Printf("[ECH DEBUG]   expandedInnerHello len=%d, encodedInnerHello len=%d\n",
-			len(echCtx.expandedInnerHello), len(echCtx.encodedInnerHello))
-
-		// Dump the outer hello being used for decoding
-		outerBytes := outer.original
-		if outerBytes == nil {
-			outerBytes, _ = outer.marshal()
-		}
-		fmt.Printf("\n[ECH DEBUG] === OUTER HELLO FOR DECODE (echTranscriptMsg) ===\n")
-		for i := 0; i < len(outerBytes); i += 64 {
-			end := i + 64
-			if end > len(outerBytes) {
-				end = len(outerBytes)
-			}
-			fmt.Printf("[OUTER %04d-%04d] %x\n", i, end, outerBytes[i:end])
-		}
-		fmt.Printf("[ECH DEBUG] === END OUTER HELLO ===\n\n")
-
-		// Use decode path like non-PSK case
-		decodedInner, err := decodeInnerClientHello(outer, echCtx.encodedInnerHello)
-		if err != nil {
-			fmt.Printf("[ECH DEBUG]   decode failed: %v\n", err)
-			return err
-		}
-
-		if err := transcriptMsg(decodedInner, echCtx.innerTranscript); err != nil {
-			return err
-		}
-
-		// Compare with expandedInnerHello
-		decodeBytes := decodedInner.original
-		if decodeBytes == nil {
-			decodeBytes, _ = decodedInner.marshal()
-		}
-
-		// Dump FULL decoded inner (what's written to transcript)
-		fmt.Printf("\n[ECH DEBUG] === FULL DECODED INNER (WRITTEN TO TRANSCRIPT) ===\n")
-		for i := 0; i < len(decodeBytes); i += 64 {
-			end := i + 64
-			if end > len(decodeBytes) {
-				end = len(decodeBytes)
-			}
-			fmt.Printf("[DEC %04d-%04d] %x\n", i, end, decodeBytes[i:end])
-		}
-		fmt.Printf("[ECH DEBUG] === END DECODED INNER ===\n\n")
-
-		// Dump FULL expandedInnerHello for comparison
-		fmt.Printf("\n[ECH DEBUG] === FULL EXPANDED INNER HELLO (FOR COMPARISON) ===\n")
-		for i := 0; i < len(echCtx.expandedInnerHello); i += 64 {
-			end := i + 64
-			if end > len(echCtx.expandedInnerHello) {
-				end = len(echCtx.expandedInnerHello)
-			}
-			fmt.Printf("[EXP %04d-%04d] %x\n", i, end, echCtx.expandedInnerHello[i:end])
-		}
-		fmt.Printf("[ECH DEBUG] === END EXPANDED INNER ===\n\n")
-
-		fmt.Printf("[ECH DEBUG]   decoded len=%d, expandedInnerHello len=%d\n", len(decodeBytes), len(echCtx.expandedInnerHello))
-		if len(decodeBytes) == len(echCtx.expandedInnerHello) {
-			match := true
-			for i := range decodeBytes {
-				if decodeBytes[i] != echCtx.expandedInnerHello[i] {
-					match = false
-					fmt.Printf("[ECH DEBUG]   MISMATCH at byte %d: decoded=0x%02x, expanded=0x%02x\n",
-						i, decodeBytes[i], echCtx.expandedInnerHello[i])
-					break
-				}
-			}
-			if match {
-				fmt.Printf("[ECH DEBUG]   Decoded bytes MATCH expandedInnerHello!\n")
-			}
-		} else {
-			fmt.Printf("[ECH DEBUG]   LENGTH MISMATCH!\n")
-		}
-		fmt.Printf("[ECH DEBUG]   innerTranscript hash after decode=%x\n", echCtx.innerTranscript.Sum(nil)[:16])
+	// PSK case: Use expandedInnerHello directly (this is what was used for PSK binder)
+	// The server accepts our binder, proving its expansion matches expandedInnerHello
+	if len(echCtx.expandedInnerHello) > 0 {
+		fmt.Printf("[ECH DEBUG]   PSK case - Using expandedInnerHello directly\n")
+		echCtx.innerTranscript.Write(echCtx.expandedInnerHello)
+		fmt.Printf("[ECH DEBUG]   innerTranscript hash after write=%x\n", echCtx.innerTranscript.Sum(nil)[:16])
 		return nil
 	}
 

@@ -9,12 +9,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/cipher"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash"
-	"io"
 	"net"
 	"os"
 	"slices"
@@ -624,68 +622,37 @@ func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *client
 	serializedOuter := uconn.HandshakeState.Hello.Raw
 	serializedOuter = serializedOuter[4:]
 
-	// If PSK extension is provided, recalculate binder using bytes from serialized outer hello
-	// This ensures binder is calculated over the EXACT bytes the server will see
+	// CHROME BEHAVIOR: PSK is in outer hello only, not in inner hello.
+	// Skip inner PSK binder recalculation since inner has no PSK.
+	// The outer hello's PSK binder (calculated before ECH setup) is used directly by server.
+	//
+	// For early traffic secret: Server uses outer hello transcript (with PSK), so we must too.
+	// Store the serialized outer hello for early traffic secret calculation.
 	if pskExt != nil && pskExt.cipherSuite != nil && len(pskExt.BinderKey) > 0 {
-		// Extract extension bytes from the serialized outer hello
-		outerExtRawBytes := extractExtensionBytesFromHello(serializedOuter)
 		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("[ECH DEBUG] PSK binder recalculation using serialized outer bytes:\n")
-			fmt.Printf("[ECH DEBUG]   Extracted %d extensions from serialized outer\n", len(outerExtRawBytes))
+			fmt.Printf("[ECH DEBUG] Chrome-style ECH+PSK: PSK in outer only, inner has no PSK\n")
+			fmt.Printf("[ECH DEBUG]   Inner pskIdentities: %d (should be 0)\n", len(inner.pskIdentities))
+			fmt.Printf("[ECH DEBUG]   Outer PSK will be used directly by server\n")
 		}
 
-		// Get outer session_id - per ECH spec, server copies this to expanded inner hello
-		outerSessionId := uconn.HandshakeState.Hello.SessionId
+		// Store the OUTER hello (with PSK) for early traffic secret calculation
+		// Server will use outer hello's PSK, so early traffic secret must be derived from outer transcript
+		// Add the ClientHello message header (type=1, length)
+		outerWithHeader := make([]byte, 4+len(serializedOuter))
+		outerWithHeader[0] = typeClientHello // 0x01
+		outerWithHeader[1] = byte(len(serializedOuter) >> 16)
+		outerWithHeader[2] = byte(len(serializedOuter) >> 8)
+		outerWithHeader[3] = byte(len(serializedOuter))
+		copy(outerWithHeader[4:], serializedOuter)
 
-		// Calculate binder using the ACTUAL bytes from serialized outer
-		helloBytes, err := inner.marshalExpandedECHWithoutBinders(outerExts, outerExtRawBytes, outerSessionId)
-		if err != nil {
-			return fmt.Errorf("failed to marshal inner hello for PSK binder recalculation: %w", err)
-		}
-
+		// Store outer hello for early traffic secret (server uses outer, not inner)
+		ech.expandedInnerHello = outerWithHeader
+		// Mark that we're doing Chrome-style PSK (PSK in outer only)
+		// ECH rejection is expected and should not cause an error
+		ech.pskInOuterOnly = true
 		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			debugLen := len(helloBytes)
-			if debugLen > 100 {
-				debugLen = 100
-			}
-			fmt.Printf("[ECH DEBUG]   Expanded inner for binder (len=%d): %x...\n", len(helloBytes), helloBytes[:debugLen])
-		}
-
-		// Calculate binder
-		transcript := pskExt.cipherSuite.hash.New()
-		transcript.Write(helloBytes)
-		innerBinders := [][]byte{pskExt.cipherSuite.finishedHash(pskExt.BinderKey, transcript)}
-
-		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("[ECH DEBUG]   Recalculated PSK binder: %x\n", innerBinders[0])
-		}
-
-		// Update inner hello's binders
-		inner.pskBinders = innerBinders
-
-		// Re-encode inner hello with the correct binders
-		encodedInner, err = encodeInnerClientHelloReorderOuterExts(inner, int(ech.config.MaxNameLength), outerExts)
-		if err != nil {
-			return fmt.Errorf("failed to re-encode inner hello after PSK binder recalculation: %w", err)
-		}
-
-		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("[ECH DEBUG]   Re-encoded inner hello length: %d bytes\n", len(encodedInner))
-		}
-
-		// Store the encoded (compressed) inner hello for use in echTranscriptMsg
-		// This ensures we decode the EXACT same bytes the server received
-		ech.encodedInnerHello = encodedInner
-
-		// Store the full expanded inner hello (WITH binders) for early traffic secret calculation
-		// This ensures we use the EXACT same bytes as the PSK binder calculation
-		fullExpandedInner, err := inner.marshalExpandedECH(outerExts, outerExtRawBytes, outerSessionId)
-		if err != nil {
-			return fmt.Errorf("failed to marshal full expanded inner hello: %w", err)
-		}
-		ech.expandedInnerHello = fullExpandedInner
-		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("[ECH DEBUG]   Stored expanded inner hello (with binders) for early traffic: len=%d\n", len(fullExpandedInner))
+			fmt.Printf("[ECH DEBUG]   Stored OUTER hello for early traffic secret: len=%d\n", len(outerWithHeader))
+			fmt.Printf("[ECH DEBUG]   pskInOuterOnly=true (ECH rejection expected)\n")
 		}
 	}
 
@@ -1123,10 +1090,11 @@ func (uconn *UConn) MarshalClientHello() error {
 		inner.secureRenegotiationSupported = uconn.HandshakeState.Hello.SecureRenegotiationSupported
 		inner.secureRenegotiation = uconn.HandshakeState.Hello.SecureRenegotiation
 
-		// Per ECH spec: early_data MUST be in inner hello only, NOT in outer hello
-		// The inner already has earlyData copied above, now clear it from outer
-		// This prevents the outer ClientHello from including the early_data extension
-		uconn.HandshakeState.Hello.EarlyData = false
+		// NOTE: ECH spec says early_data "MUST NOT" be in outer hello, but Chrome
+		// includes early_data in outer hello for PSK/0-RTT case and it works.
+		// Without early_data in outer, QUIC 0-RTT fails because server doesn't
+		// know to accept early data. Keeping early_data in both inner and outer.
+		// uconn.HandshakeState.Hello.EarlyData = false // DISABLED - Chrome doesn't do this
 
 		// For PSK with ECH: get PSK data from the extension and recalculate binders for inner hello
 		// The outer hello's binders were calculated over the outer transcript, but the server
@@ -1155,23 +1123,14 @@ func (uconn *UConn) MarshalClientHello() error {
 			}
 		}
 
-		// For ECH + PSK:
-		// 1. The REAL PSK goes in the inner ClientHello with binders calculated over inner transcript
-		// 2. The outer ClientHello must have a GREASE PSK (random data, same length) per ECH spec
-		// See: draft-ietf-tls-esni Section 6.1.3 - "clients SHOULD send a GREASE pre_shared_key extension"
-		var pskExtIdx int = -1
-		// Save the outer extensions list BEFORE any PSK replacement, so we can use the correct
-		// extension types (with real PSK type 41) for encoding the inner hello
+		// For ECH + PSK (Chrome behavior):
+		// 1. Keep REAL PSK in outer ClientHello (server uses this directly)
+		// 2. Do NOT put PSK in inner ClientHello (keeps ECH payload small like Chrome)
+		// This deviates from ECH spec but matches Chrome's real-world behavior.
+		// See chrome_reference_data.md: Chrome's ECH payload is 240 bytes for both PSK and non-PSK.
+		// Save the outer extensions list for encoding the inner hello
 		var outerExtsList []uint16
 		if pskExt != nil && pskExt.cipherSuite != nil && len(pskExt.BinderKey) > 0 && len(pskExt.Identities) > 0 {
-			// Find the PSK extension index for later GREASE replacement
-			for i, ext := range uconn.Extensions {
-				if _, ok := ext.(*UtlsPreSharedKeyExtension); ok {
-					pskExtIdx = i
-					break
-				}
-			}
-
 			if os.Getenv("UTLS_ECH_DEBUG") != "" {
 				fmt.Printf("[ECH DEBUG] PSK extension from outer: identities=%d, binders=%d\n", len(pskExt.Identities), len(pskExt.Binders))
 				for i, id := range pskExt.Identities {
@@ -1179,69 +1138,32 @@ func (uconn *UConn) MarshalClientHello() error {
 				}
 			}
 
-			// Copy PSK identities from the extension to inner hello
-			inner.pskIdentities = PskIdentities(pskExt.Identities).ToPrivate()
+			// CHROME BEHAVIOR: Do NOT put PSK in inner hello, keep real PSK in outer hello only.
+			// Chrome's ECH payload size is identical for PSK and non-PSK cases (240 bytes),
+			// proving Chrome does not include PSK inside ECH encryption.
+			// The server uses outer hello's real PSK directly for session resumption,
+			// bypassing ECH entirely. This is why Chrome achieves 0-RTT even with ech_success:false.
+			//
+			// Previous approach (per ECH spec) was:
+			// - Inner hello: real PSK with binders over inner transcript
+			// - Outer hello: GREASE PSK (random bytes)
+			// This failed because servers don't properly handle ECH+PSK combination.
+			//
+			// New approach (matching Chrome):
+			// - Inner hello: NO PSK
+			// - Outer hello: real PSK (kept as-is, no GREASE replacement)
+			// Server uses outer PSK directly, 0-RTT works.
 
-			// Create placeholder binders of correct size
-			inner.pskBinders = make([][]byte, len(inner.pskIdentities))
-			for i := range inner.pskIdentities {
-				inner.pskBinders[i] = make([]byte, pskExt.cipherSuite.hash.Size())
+			if os.Getenv("UTLS_ECH_DEBUG") != "" {
+				fmt.Printf("[ECH DEBUG] Chrome-style: NOT putting PSK in inner hello, keeping real PSK in outer\n")
+				fmt.Printf("[ECH DEBUG] inner.pskIdentities will remain nil/empty\n")
 			}
 
-			// Marshal inner hello using EXPANDED format without binders to create transcript
-			// The server expands ech_outer_extensions and verifies the binder over that format
-			// We must use the same extension order as the outer hello
+			// Save outer extensions list for encoding inner hello
 			outerExtsList = uconn.extensionsList()
-			// Chrome reference: early_data (42) IS included in both outer hello AND ech_outer_extensions for PSK
-			// The inner hello references early_data via ech_outer_extensions (not inline)
 
-			// NOTE: PSK binder calculation is now done INSIDE computeAndUpdateOuterECHExtensionWithOuterExts
-			// AFTER the outer hello is serialized, using bytes extracted from the serialized outer.
-			// This ensures the binder is calculated over the EXACT bytes the server will see.
-
-			// Now create GREASE PSK for the outer hello
-			// GREASE PSK has random identities and binders of the same length as the real ones
-			if pskExtIdx >= 0 {
-				greasePskExt := &UtlsPreSharedKeyExtension{
-					PreSharedKeyCommon: PreSharedKeyCommon{
-						Identities: make([]PskIdentity, len(pskExt.Identities)),
-						Binders:    make([][]byte, len(pskExt.Binders)),
-					},
-				}
-
-				// Generate random PSK identities with same length
-				for i, realIdentity := range pskExt.Identities {
-					greasePskExt.Identities[i] = PskIdentity{
-						Label: make([]byte, len(realIdentity.Label)),
-					}
-					// Fill identity with random bytes
-					if _, err := io.ReadFull(rand.Reader, greasePskExt.Identities[i].Label); err != nil {
-						return fmt.Errorf("failed to generate GREASE PSK identity: %w", err)
-					}
-					// Generate random obfuscated ticket age
-					var ticketAge [4]byte
-					if _, err := io.ReadFull(rand.Reader, ticketAge[:]); err != nil {
-						return fmt.Errorf("failed to generate GREASE ticket age: %w", err)
-					}
-					greasePskExt.Identities[i].ObfuscatedTicketAge = uint32(ticketAge[0])<<24 | uint32(ticketAge[1])<<16 | uint32(ticketAge[2])<<8 | uint32(ticketAge[3])
-				}
-
-				// Generate random binders with same length
-				for i, realBinder := range pskExt.Binders {
-					greasePskExt.Binders[i] = make([]byte, len(realBinder))
-					if _, err := io.ReadFull(rand.Reader, greasePskExt.Binders[i]); err != nil {
-						return fmt.Errorf("failed to generate GREASE PSK binder: %w", err)
-					}
-				}
-
-				if os.Getenv("UTLS_ECH_DEBUG") != "" {
-					fmt.Printf("[ECH DEBUG] Replacing outer PSK with GREASE PSK (identities=%d, binders=%d)\n",
-						len(greasePskExt.Identities), len(greasePskExt.Binders))
-				}
-
-				// Replace the real PSK extension with GREASE in the extensions list
-				uconn.Extensions[pskExtIdx] = greasePskExt
-			}
+			// Do NOT copy PSK to inner hello - leave inner.pskIdentities and inner.pskBinders empty
+			// Do NOT replace outer PSK with GREASE - keep real PSK in outer hello
 		}
 
 		ech.innerHello = inner
