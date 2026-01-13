@@ -99,17 +99,55 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 	}
 
 	if hs.echContext != nil {
+		fmt.Printf("\n[DEBUG ECH Confirm] ============ ECH CONFIRMATION CHECK ============\n")
+		fmt.Printf("[DEBUG ECH Confirm] innerHello.random[:8]=%x\n", hs.echContext.innerHello.random[:8])
+		// Debug: Check if random in expandedInnerHello matches innerHello.random
+		if len(hs.echContext.expandedInnerHello) > 37 {
+			embeddedRandom := hs.echContext.expandedInnerHello[6:38] // offset 6-37 contains random
+			fmt.Printf("[DEBUG ECH Confirm] expandedInnerHello.random[:8]=%x\n", embeddedRandom[:8])
+			if string(embeddedRandom) != string(hs.echContext.innerHello.random) {
+				fmt.Printf("[DEBUG ECH Confirm] MISMATCH: innerHello.random != expandedInnerHello.random!\n")
+			}
+		}
+
+		// Dump FULL ServerHello
+		fmt.Printf("\n[DEBUG ECH Confirm] === FULL SERVER HELLO ===\n")
+		for i := 0; i < len(hs.serverHello.original); i += 64 {
+			end := i + 64
+			if end > len(hs.serverHello.original) {
+				end = len(hs.serverHello.original)
+			}
+			fmt.Printf("[SH %04d-%04d] %x\n", i, end, hs.serverHello.original[i:end])
+		}
+		fmt.Printf("[DEBUG ECH Confirm] === END SERVER HELLO ===\n\n")
+
+		fmt.Printf("[DEBUG ECH Confirm] innerTranscript hash before SH=%x\n", hs.echContext.innerTranscript.Sum(nil)[:16])
 		confTranscript := cloneHash(hs.echContext.innerTranscript, hs.suite.hash)
 		confTranscript.Write(hs.serverHello.original[:30])
 		confTranscript.Write(make([]byte, 8))
 		confTranscript.Write(hs.serverHello.original[38:])
+		fmt.Printf("[DEBUG ECH Confirm] confTranscript hash=%x\n", confTranscript.Sum(nil)[:16])
+		fmt.Printf("[DEBUG ECH Confirm] serverHello.original len=%d, first16=%x\n", len(hs.serverHello.original), hs.serverHello.original[:16])
+		fmt.Printf("[DEBUG ECH Confirm] serverHello.random[:8]=%x, [24:]=%x\n", hs.serverHello.random[:8], hs.serverHello.random[24:])
+		fmt.Printf("[DEBUG ECH Confirm] original[30:38]=%x (should match random[24:])\n", hs.serverHello.original[30:38])
+		// Debug: Print the EXACT bytes being hashed
+		fmt.Printf("[DEBUG ECH Confirm] full innerHello.random=%x\n", hs.echContext.innerHello.random)
+		if len(hs.echContext.expandedInnerHello) > 0 {
+			fmt.Printf("[DEBUG ECH Confirm] expandedInnerHello[0:50]=%x\n", hs.echContext.expandedInnerHello[:50])
+		}
+		prfSecret := hkdf.Extract(hs.suite.hash.New, hs.echContext.innerHello.random, nil)
+		fmt.Printf("[DEBUG ECH Confirm] prfSecret=%x\n", prfSecret)
+		transcriptHash := confTranscript.Sum(nil)
+		fmt.Printf("[DEBUG ECH Confirm] transcriptHash=%x\n", transcriptHash)
 		acceptConfirmation := tls13.ExpandLabel(hs.suite.hash.New,
-			hkdf.Extract(hs.suite.hash.New, hs.echContext.innerHello.random, nil),
+			prfSecret,
 			"ech accept confirmation",
-			confTranscript.Sum(nil),
+			transcriptHash,
 			8,
 		)
-		if subtle.ConstantTimeCompare(acceptConfirmation, hs.serverHello.random[len(hs.serverHello.random)-8:]) == 1 {
+		serverConfirmation := hs.serverHello.random[len(hs.serverHello.random)-8:]
+		fmt.Printf("[DEBUG ECH Confirm] computed=%x, server=%x, match=%v\n", acceptConfirmation, serverConfirmation, subtle.ConstantTimeCompare(acceptConfirmation, serverConfirmation) == 1)
+		if subtle.ConstantTimeCompare(acceptConfirmation, serverConfirmation) == 1 {
 			hs.hello = hs.echContext.innerHello
 			c.serverName = c.config.ServerName
 			hs.transcript = hs.echContext.innerTranscript
@@ -1032,7 +1070,10 @@ func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {
 		return errors.New("tls: received new session ticket from a client")
 	}
 
+	fmt.Printf("[DEBUG utls] handleNewSessionTicket: ticketsDisabled=%v, cacheNil=%v, quicNil=%v\n",
+		c.config.SessionTicketsDisabled, c.config.ClientSessionCache == nil, c.quic == nil)
 	if c.config.SessionTicketsDisabled || c.config.ClientSessionCache == nil {
+		fmt.Printf("[DEBUG utls] handleNewSessionTicket: returning early (disabled or no cache)\n")
 		return nil
 	}
 
@@ -1066,7 +1107,9 @@ func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {
 	session.ageAdd = msg.ageAdd
 	session.EarlyData = c.quic != nil && msg.maxEarlyData == 0xffffffff // RFC 9001, Section 4.6.1
 	session.ticket = msg.label
+	fmt.Printf("[DEBUG utls] handleNewSessionTicket: quic=%v, enableSessionEvents=%v\n", c.quic != nil, c.quic != nil && c.quic.enableSessionEvents)
 	if c.quic != nil && c.quic.enableSessionEvents {
+		fmt.Printf("[DEBUG utls] handleNewSessionTicket: calling quicStoreSession\n")
 		c.quicStoreSession(session)
 		return nil
 	}

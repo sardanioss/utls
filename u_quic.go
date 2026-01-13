@@ -25,13 +25,14 @@ type UQUICConn struct {
 //
 // The config's MinVersion must be at least TLS 1.3.
 func UQUICClient(config *QUICConfig, clientHelloID ClientHelloID) *UQUICConn {
-	return newUQUICConn(UClient(nil, config.TLSConfig, clientHelloID))
+	return newUQUICConn(UClient(nil, config.TLSConfig, clientHelloID), config)
 }
 
-func newUQUICConn(uconn *UConn) *UQUICConn {
+func newUQUICConn(uconn *UConn, config *QUICConfig) *UQUICConn {
 	uconn.quic = &quicState{
-		signalc:  make(chan struct{}),
-		blockedc: make(chan struct{}),
+		signalc:             make(chan struct{}),
+		blockedc:            make(chan struct{}),
+		enableSessionEvents: config.EnableSessionEvents, // Enable session events for QUICStoreSession/QUICResumeSession
 	}
 	uconn.quic.events = uconn.quic.eventArr[:0]
 	return &UQUICConn{
@@ -71,12 +72,24 @@ func (q *UQUICConn) NextEvent() QUICEvent {
 		// to catch callers erroniously retaining it.
 		qs.events[last].Data[0] = 0
 	}
+	// CRITICAL for 0-RTT: If we've processed all events and the handshake is waiting
+	// for us to drain (e.g., after QUICResumeSession), signal it to continue and
+	// wait for it to block again. This ensures we get all events including
+	// QUICSetWriteSecret(Early) before returning QUICNoEvent.
+	if qs.nextEvent >= len(qs.events) && qs.waitingForDrain {
+		qs.waitingForDrain = false
+		<-qs.signalc  // Unblock the handshake
+		<-qs.blockedc // Wait for it to block again (with new events added)
+	}
 	if qs.nextEvent >= len(qs.events) {
 		qs.events = qs.events[:0]
 		qs.nextEvent = 0
 		return QUICEvent{Kind: QUICNoEvent}
 	}
 	e := qs.events[qs.nextEvent]
+	if e.Kind == QUICStoreSession {
+		fmt.Printf("[DEBUG utls] NextEvent: returning QUICStoreSession, SessionState=%v\n", e.SessionState != nil)
+	}
 	qs.events[qs.nextEvent] = QUICEvent{} // zero out references to data
 	qs.nextEvent++
 	return e
@@ -164,13 +177,17 @@ func (q *UQUICConn) StoreSession(session *SessionState) error {
 		return quicError(errors.New("tls: StoreSessionTicket called on the server"))
 	}
 	cacheKey := c.clientSessionCacheKey()
+	fmt.Printf("[DEBUG utls] StoreSession: uquicConnPtr=%p, uconnPtr=%p, connPtr=%p, configPtr=%p, cachePtr=%p, cacheKey=%s\n", q, q.conn, c, c.config, c.config.ClientSessionCache, cacheKey)
 	if cacheKey == "" {
+		fmt.Printf("[DEBUG utls] StoreSession: returning early (empty cacheKey)\n")
 		return nil
 	}
 	if c.config.ClientSessionCache == nil {
+		fmt.Printf("[DEBUG utls] StoreSession: returning early (nil ClientSessionCache)\n")
 		return nil
 	}
 	cs := &ClientSessionState{session: session}
+	fmt.Printf("[DEBUG utls] StoreSession: storing session with earlyData=%v\n", session.EarlyData)
 	c.config.ClientSessionCache.Put(cacheKey, cs)
 	return nil
 }

@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
@@ -472,6 +471,7 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 			// does require servers to abort on invalid binders, so we need to
 			// delete tickets to recover from a corrupted PSK.
 			if err != nil {
+				fmt.Printf("[DEBUG ECH+PSK] Handshake failed with error: %v\n", err)
 				if cacheKey := c.clientSessionCacheKey(); cacheKey != "" {
 					c.config.ClientSessionCache.Put(cacheKey, nil)
 				}
@@ -480,6 +480,7 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	}
 
 	if ech != nil && c.clientHelloBuildStatus != BuildByUtls {
+		fmt.Printf("[DEBUG ECH] clientHelloBuildStatus=%d (BuildByUtls=%d), rebuilding ECH\n", c.clientHelloBuildStatus, BuildByUtls)
 		// Split hello into inner and outer
 		ech.innerHello = hello.clone()
 
@@ -501,6 +502,8 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		if err := c.computeAndUpdateOuterECHExtension(ech.innerHello, ech, true); err != nil {
 			return err
 		}
+	} else if ech != nil {
+		fmt.Printf("[DEBUG ECH] clientHelloBuildStatus=%d (BuildByUtls=%d), skipping ECH rebuild (already done)\n", c.clientHelloBuildStatus, BuildByUtls)
 	}
 
 	c.serverName = hello.serverName
@@ -509,16 +512,65 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		return err
 	}
 
-	if hello.earlyData {
+	// For ECH, check inner hello's earlyData flag and use EXPANDED inner hello for transcript
+	// CRITICAL: The early traffic secret must be derived from the EXPANDED inner hello format,
+	// not the compressed format. The server uses the expanded format, so we must match it.
+	earlyDataEnabled := hello.earlyData
+	if ech != nil && ech.innerHello != nil {
+		earlyDataEnabled = ech.innerHello.earlyData
+		fmt.Printf("[DEBUG ECH+PSK] ECH enabled: inner.earlyData=%v, outer.earlyData=%v\n", ech.innerHello.earlyData, hello.earlyData)
+	}
+	if earlyDataEnabled && session != nil {
+		fmt.Printf("[DEBUG ECH+PSK] Setting up early traffic secret...\n")
 		suite := cipherSuiteTLS13ByID(session.cipherSuite)
 		transcript := suite.hash.New()
-		if err := transcriptMsg(hello, transcript); err != nil {
-			return err
+
+		if ech != nil && ech.expandedInnerHello != nil {
+			// Use the pre-computed expanded inner hello (stored during ECH setup)
+			// This ensures we use the EXACT same bytes as the PSK binder calculation
+			fmt.Printf("[DEBUG ECH+PSK] Using stored expandedInnerHello for early traffic: len=%d\n", len(ech.expandedInnerHello))
+			transcript.Write(ech.expandedInnerHello)
+			fmt.Printf("[DEBUG ECH+PSK] Wrote expandedInnerHello to transcript\n")
+		} else if ech != nil && ech.innerHello != nil {
+			// Fallback: compute expanded inner hello (for non-PSK ECH case)
+			// This shouldn't happen for PSK since we store expandedInnerHello above
+			encodedInner, err := encodeInnerClientHelloReorderOuterExts(ech.innerHello, int(ech.config.MaxNameLength), c.extensionsList())
+			if err != nil {
+				fmt.Printf("[DEBUG ECH+PSK] Failed to encode inner hello for early traffic secret: %v\n", err)
+				return err
+			}
+
+			hello.original = c.HandshakeState.Hello.Raw
+
+			decodedInner, err := decodeInnerClientHello(hello, encodedInner)
+			if err != nil {
+				fmt.Printf("[DEBUG ECH+PSK] Failed to decode inner hello for early traffic secret: %v\n", err)
+				return err
+			}
+
+			fmt.Printf("[DEBUG ECH+PSK] Decoded inner hello: pskIdentities=%d, pskBinders=%d, earlyData=%v\n",
+				len(decodedInner.pskIdentities), len(decodedInner.pskBinders), decodedInner.earlyData)
+
+			if err := transcriptMsg(decodedInner, transcript); err != nil {
+				fmt.Printf("[DEBUG ECH+PSK] transcriptMsg (decoded inner) failed: %v\n", err)
+				return err
+			}
+			fmt.Printf("[DEBUG ECH+PSK] Using EXPANDED inner hello for early traffic secret transcript\n")
+		} else {
+			// Non-ECH case: use hello directly
+			if err := transcriptMsg(hello, transcript); err != nil {
+				fmt.Printf("[DEBUG ECH+PSK] transcriptMsg failed: %v\n", err)
+				return err
+			}
 		}
+
 		earlyTrafficSecret := earlySecret.ClientEarlyTrafficSecret(transcript)
+		fmt.Printf("[DEBUG ECH+PSK] Calling quicSetWriteSecret for early data...\n")
 		c.quicSetWriteSecret(QUICEncryptionLevelEarly, suite.id, earlyTrafficSecret)
+		fmt.Printf("[DEBUG ECH+PSK] Early traffic secret set successfully\n")
 	}
 
+	fmt.Printf("[DEBUG ECH+PSK] About to read ServerHello...\n")
 	// serverHelloMsg is not included in the transcript
 	msg, err := c.readHandshake(nil)
 	if err != nil {
@@ -590,27 +642,112 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 }
 
 func (c *UConn) echTranscriptMsg(outer *clientHelloMsg, echCtx *echClientContext) (err error) {
-	// Recreate the inner ClientHello from its compressed form using server's decodeInnerClientHello function.
-	// See https://github.com/sardanioss/utls/blob/e430876b1d82fdf582efc57f3992d448e7ab3d8a/ech.go#L276-L283
+	// For PSK+ECH, we MUST use the SAME expanded inner ClientHello that was used
+	// for the PSK binder calculation. This is stored in echCtx.expandedInnerHello.
+	//
+	// The server accepts our PSK binder (calculated using marshalExpandedECH output),
+	// which proves the server's expansion matches our expandedInnerHello.
+	// Using decodeInnerClientHello might produce different bytes due to:
+	// 1. Different outer extension bytes in the `outer` parameter
+	// 2. Re-serialization differences
+	//
+	// Therefore, when expandedInnerHello is available, use it DIRECTLY.
 
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG] === echTranscriptMsg ===\n")
-		fmt.Printf("[ECH DEBUG]   extensionsList: %v\n", c.extensionsList())
-		fmt.Printf("[ECH DEBUG]   inner.serverName: %s\n", echCtx.innerHello.serverName)
+	fmt.Printf("[ECH DEBUG] === echTranscriptMsg ===\n")
+	fmt.Printf("[ECH DEBUG]   expandedInnerHello len: %d\n", len(echCtx.expandedInnerHello))
+
+	// PSK case: Try using decode path instead of expandedInnerHello to see if it works
+	// EXPERIMENT: Bypass expandedInnerHello and use decode path
+	if len(echCtx.expandedInnerHello) > 0 && len(echCtx.encodedInnerHello) > 0 {
+		fmt.Printf("[ECH DEBUG]   PSK case - EXPERIMENT: Using decode path instead of expandedInnerHello\n")
+		fmt.Printf("[ECH DEBUG]   expandedInnerHello len=%d, encodedInnerHello len=%d\n",
+			len(echCtx.expandedInnerHello), len(echCtx.encodedInnerHello))
+
+		// Dump the outer hello being used for decoding
+		outerBytes := outer.original
+		if outerBytes == nil {
+			outerBytes, _ = outer.marshal()
+		}
+		fmt.Printf("\n[ECH DEBUG] === OUTER HELLO FOR DECODE (echTranscriptMsg) ===\n")
+		for i := 0; i < len(outerBytes); i += 64 {
+			end := i + 64
+			if end > len(outerBytes) {
+				end = len(outerBytes)
+			}
+			fmt.Printf("[OUTER %04d-%04d] %x\n", i, end, outerBytes[i:end])
+		}
+		fmt.Printf("[ECH DEBUG] === END OUTER HELLO ===\n\n")
+
+		// Use decode path like non-PSK case
+		decodedInner, err := decodeInnerClientHello(outer, echCtx.encodedInnerHello)
+		if err != nil {
+			fmt.Printf("[ECH DEBUG]   decode failed: %v\n", err)
+			return err
+		}
+
+		if err := transcriptMsg(decodedInner, echCtx.innerTranscript); err != nil {
+			return err
+		}
+
+		// Compare with expandedInnerHello
+		decodeBytes := decodedInner.original
+		if decodeBytes == nil {
+			decodeBytes, _ = decodedInner.marshal()
+		}
+
+		// Dump FULL decoded inner (what's written to transcript)
+		fmt.Printf("\n[ECH DEBUG] === FULL DECODED INNER (WRITTEN TO TRANSCRIPT) ===\n")
+		for i := 0; i < len(decodeBytes); i += 64 {
+			end := i + 64
+			if end > len(decodeBytes) {
+				end = len(decodeBytes)
+			}
+			fmt.Printf("[DEC %04d-%04d] %x\n", i, end, decodeBytes[i:end])
+		}
+		fmt.Printf("[ECH DEBUG] === END DECODED INNER ===\n\n")
+
+		// Dump FULL expandedInnerHello for comparison
+		fmt.Printf("\n[ECH DEBUG] === FULL EXPANDED INNER HELLO (FOR COMPARISON) ===\n")
+		for i := 0; i < len(echCtx.expandedInnerHello); i += 64 {
+			end := i + 64
+			if end > len(echCtx.expandedInnerHello) {
+				end = len(echCtx.expandedInnerHello)
+			}
+			fmt.Printf("[EXP %04d-%04d] %x\n", i, end, echCtx.expandedInnerHello[i:end])
+		}
+		fmt.Printf("[ECH DEBUG] === END EXPANDED INNER ===\n\n")
+
+		fmt.Printf("[ECH DEBUG]   decoded len=%d, expandedInnerHello len=%d\n", len(decodeBytes), len(echCtx.expandedInnerHello))
+		if len(decodeBytes) == len(echCtx.expandedInnerHello) {
+			match := true
+			for i := range decodeBytes {
+				if decodeBytes[i] != echCtx.expandedInnerHello[i] {
+					match = false
+					fmt.Printf("[ECH DEBUG]   MISMATCH at byte %d: decoded=0x%02x, expanded=0x%02x\n",
+						i, decodeBytes[i], echCtx.expandedInnerHello[i])
+					break
+				}
+			}
+			if match {
+				fmt.Printf("[ECH DEBUG]   Decoded bytes MATCH expandedInnerHello!\n")
+			}
+		} else {
+			fmt.Printf("[ECH DEBUG]   LENGTH MISMATCH!\n")
+		}
+		fmt.Printf("[ECH DEBUG]   innerTranscript hash after decode=%x\n", echCtx.innerTranscript.Sum(nil)[:16])
+		return nil
 	}
 
+	// Non-PSK case: Use encode/decode path
+	fmt.Printf("[ECH DEBUG]   No expandedInnerHello available, using encode/decode path (non-PSK case)\n")
+
+	// Encode the inner hello (compressed format with ech_outer_extensions)
 	encodedInner, err := encodeInnerClientHelloReorderOuterExts(echCtx.innerHello, int(echCtx.config.MaxNameLength), c.extensionsList())
 	if err != nil {
 		return err
 	}
 
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG]   echTranscriptMsg encodedInner length: %d\n", len(encodedInner))
-		if len(encodedInner) > 32 {
-			fmt.Printf("[ECH DEBUG]   echTranscriptMsg encodedInner (first 32): %x\n", encodedInner[:32])
-		}
-	}
-
+	// Decode/expand the inner hello using outer hello
 	decodedInner, err := decodeInnerClientHello(outer, encodedInner)
 	if err != nil {
 		return err

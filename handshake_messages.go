@@ -7,6 +7,7 @@ package tls
 import (
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 
@@ -112,6 +113,9 @@ func (m *clientHelloMsg) marshalMsg(echInner bool) ([]byte, error) {
 
 func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []uint16) ([]byte, error) {
 	// [uTLS SECTION END]
+	if os.Getenv("UTLS_ECH_DEBUG") != "" && echInner && outerExts != nil {
+		fmt.Printf("[ECH DEBUG] marshalMsgReorderOuterExts called with outerExts: %v\n", outerExts)
+	}
 	var exts cryptobyte.Builder
 	var echOuterExts []uint16
 
@@ -148,10 +152,10 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 
 		// 3. Build ech_outer_extensions list - order follows outer hello
 		// Iterate through outer extensions and add compressible ones to the list
-		// RFC 8446 + ECH spec: Most extensions can be compressed via ech_outer_extensions
-		// Exceptions: server_name (different in inner/outer), encrypted_client_hello, supported_versions
-		// Note: GREASE extensions ARE included in ech_outer_extensions so the expanded inner hello
-		// matches Chrome's fingerprint (Chrome includes GREASE at start and end of extensions)
+		// Chrome includes most extensions via ech_outer_extensions, including:
+		// - supported_versions (43), early_data (42), compress_certificate (27), application_settings (17613)
+		// These are expanded from outer hello using raw bytes for PSK binder calculation
+		// Exceptions: server_name (different SNI), encrypted_client_hello, pre_shared_key
 		for _, extType := range outerExts {
 			// Include GREASE extensions (pattern: extType&0x0f0f == 0x0a0a)
 			if extType&0x0f0f == 0x0a0a {
@@ -159,12 +163,6 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 				continue
 			}
 			switch extType {
-			case utlsExtensionApplicationSettingsNew, utlsExtensionApplicationSettings:
-				if slices.Contains(outerExts, utlsExtensionApplicationSettingsNew) {
-					echOuterExts = append(echOuterExts, utlsExtensionApplicationSettingsNew)
-				} else if slices.Contains(outerExts, utlsExtensionApplicationSettings) {
-					echOuterExts = append(echOuterExts, utlsExtensionApplicationSettings)
-				}
 			case extensionPSKModes:
 				echOuterExts = append(echOuterExts, extensionPSKModes)
 			case extensionSupportedCurves:
@@ -173,13 +171,10 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 				echOuterExts = append(echOuterExts, extensionALPN)
 			case extensionSignatureAlgorithms:
 				echOuterExts = append(echOuterExts, extensionSignatureAlgorithms)
-			case utlsExtensionCompressCertificate:
-				echOuterExts = append(echOuterExts, utlsExtensionCompressCertificate)
 			case extensionQUICTransportParameters:
 				echOuterExts = append(echOuterExts, extensionQUICTransportParameters)
 			case extensionKeyShare:
 				echOuterExts = append(echOuterExts, extensionKeyShare)
-			// Additional extensions for Chrome fingerprint matching
 			case extensionRenegotiationInfo:
 				echOuterExts = append(echOuterExts, extensionRenegotiationInfo)
 			case extensionSCT:
@@ -194,9 +189,21 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 				echOuterExts = append(echOuterExts, extensionExtendedMasterSecret)
 			case extensionSignatureAlgorithmsCert:
 				echOuterExts = append(echOuterExts, extensionSignatureAlgorithmsCert)
-			// Note: server_name (different SNI), encrypted_client_hello, and supported_versions
-			// are NOT in ech_outer_extensions - they're serialized directly in inner hello
+			// Chrome includes these via ech_outer_extensions (expanded from outer hello raw bytes)
+			case utlsExtensionCompressCertificate:
+				echOuterExts = append(echOuterExts, utlsExtensionCompressCertificate)
+			case utlsExtensionApplicationSettings, utlsExtensionApplicationSettingsNew:
+				echOuterExts = append(echOuterExts, extType) // Use actual extension type (17513 or 17613)
+			case extensionSupportedVersions:
+				echOuterExts = append(echOuterExts, extensionSupportedVersions)
+			case extensionEarlyData:
+				echOuterExts = append(echOuterExts, extensionEarlyData)
+			// Note: server_name, encrypted_client_hello, and pre_shared_key are NOT compressed
 			}
+		}
+
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG] Built echOuterExts: %v\n", echOuterExts)
 		}
 
 		// Add ech_outer_extensions - ALWAYS third
@@ -211,36 +218,10 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 			})
 		}
 
-		// 4. Add supported_versions inline (NOT via ech_outer_extensions)
-		// ECH inner must be TLS 1.3 only, filter out TLS 1.2 and older
-		if len(m.supportedVersions) > 0 {
-			var tls13Versions []uint16
-			for _, vers := range m.supportedVersions {
-				// Keep GREASE and TLS 1.3 only
-				if vers == VersionTLS13 || vers&0x0f0f == 0x0a0a {
-					tls13Versions = append(tls13Versions, vers)
-				}
-			}
-			if len(tls13Versions) > 0 {
-				exts.AddUint16(extensionSupportedVersions)
-				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
-					exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
-						for _, vers := range tls13Versions {
-							exts.AddUint16(vers)
-						}
-					})
-				})
-			}
-		}
+		// 4. supported_versions and early_data come via ech_outer_extensions (not inline)
+		// Chrome references them from outer hello via ech_outer_extensions
 
-		// 5. Add early_data if present (for 0-RTT with ECH)
-		// Per ECH spec: early_data MUST be in inner hello, NOT in outer hello
-		if m.earlyData {
-			exts.AddUint16(extensionEarlyData)
-			exts.AddUint16(0) // empty extension_data
-		}
-
-		// 6. Add pre_shared_key if present - MUST be last extension (RFC 8446)
+		// 5. Add pre_shared_key if present - MUST be last extension (RFC 8446)
 		// For ECH, PSK must be in the inner ClientHello with binders calculated over inner hello
 		if len(m.pskIdentities) > 0 {
 			exts.AddUint16(extensionPreSharedKey)
@@ -315,8 +296,9 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 		exts.AddUint16(extensionSCT)
 		exts.AddUint16(0) // empty extension_data
 	}
-	if m.earlyData {
+	if m.earlyData && !echInner {
 		// RFC 8446, Section 4.2.10
+		// For ECH inner, early_data comes via ech_outer_extensions (added below)
 		exts.AddUint16(extensionEarlyData)
 		exts.AddUint16(0) // empty extension_data
 	}
@@ -504,36 +486,27 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 	// Add uTLS-specific extensions to echOuterExts if they're in the outer hello
 	// These extensions are handled by TLSExtension interface, not clientHelloMsg fields
 	if echInner && outerExts != nil {
-		// compress_certificate (27) - Chrome includes this in ech_outer_extensions
-		if slices.Contains(outerExts, utlsExtensionCompressCertificate) {
-			echOuterExts = append(echOuterExts, utlsExtensionCompressCertificate)
-		}
-		// application_settings (17613) - Chrome includes this in ech_outer_extensions
-		if slices.Contains(outerExts, utlsExtensionApplicationSettingsNew) {
-			echOuterExts = append(echOuterExts, utlsExtensionApplicationSettingsNew)
-		}
-		// application_settings old (17513) - for older Chrome versions
-		if slices.Contains(outerExts, utlsExtensionApplicationSettings) {
-			echOuterExts = append(echOuterExts, utlsExtensionApplicationSettings)
-		}
+		// Note: Several extensions are NOT included in ech_outer_extensions because
+		// the expanded inner hello (for PSK binder calculation) uses clientHelloMsg fields
+		// which might not match the actual extension bytes in the outer hello.
+		// This causes binder mismatch if included. Extensions excluded:
+		// - compress_certificate (27): no field in clientHelloMsg
+		// - application_settings (17613): marshaling might differ from TLSExtension.Read()
 	}
-	// Reorder echOuterExts to match Chrome's specific order for ech_outer_extensions
-	// Chrome order: ALPN, key_share, compress_certificate, signature_algorithms,
-	//               application_settings, supported_versions, psk_key_exchange_modes,
-	//               supported_groups, quic_transport_parameters
+	// Reorder echOuterExts to match Chrome's order for ech_outer_extensions
+	// Note: compress_certificate (27) and application_settings (17613, 17513) are NOT
+	// included because they can't be correctly reconstructed from clientHelloMsg fields
 	if echInner && outerExts != nil {
 		chromeECHOuterOrder := []uint16{
 			extensionALPN,                         // 16
 			extensionKeyShare,                     // 51
-			utlsExtensionCompressCertificate,      // 27
 			extensionSignatureAlgorithms,          // 13
-			utlsExtensionApplicationSettingsNew,   // 17613
-			utlsExtensionApplicationSettings,      // 17513 (fallback)
+			// Note: application_settings excluded - marshaling mismatch
 			extensionSupportedVersions,            // 43
 			extensionPSKModes,                     // 45
 			extensionSupportedCurves,              // 10 (supported_groups)
 			extensionQUICTransportParameters,      // 57
-			// HTTP/2 (TCP) specific extensions - must be included for proper fingerprinting
+			// HTTP/2 (TCP) specific extensions
 			extensionStatusRequest,                // 5 (OCSP stapling)
 			extensionSupportedPoints,              // 11 (EC point formats)
 			extensionSCT,                          // 18 (signed certificate timestamp)
@@ -678,25 +651,75 @@ func (m *clientHelloMsg) marshalWithoutBindersECH(outerExts []uint16) ([]byte, e
 // This is needed for PSK binder calculation with ECH, as the server verifies binders
 // over the expanded (reconstructed) ClientHelloInner, not the compressed format.
 // The outerExts parameter specifies the extension order from the outer hello.
-func (m *clientHelloMsg) marshalExpandedECHWithoutBinders(outerExts []uint16) ([]byte, error) {
-	bindersLen := 2 // uint16 length prefix
+// The outerExtRawBytes parameter contains the raw bytes of each extension from the outer hello.
+// The outerSessionId parameter is the session_id from the outer ClientHello - per ECH spec,
+// the server copies this to the expanded inner hello, so we must include it in binder calculation.
+// Using raw bytes ensures byte-identical expansion to what the server computes.
+func (m *clientHelloMsg) marshalExpandedECHWithoutBinders(outerExts []uint16, outerExtRawBytes map[uint16][]byte, outerSessionId []byte) ([]byte, error) {
+	// Per RFC 8446 Section 4.2.11.2:
+	// "The length fields for the message (including the overall length, the length
+	// of the extensions block, and the length of the "pre_shared_key" extension)
+	// are all set as if binders of the correct lengths were present."
+	//
+	// So we DO NOT update any length fields - we just truncate the binder bytes.
+
+	bindersLen := 2 // uint16 length prefix for binders list
 	for _, binder := range m.pskBinders {
-		bindersLen += 1 // uint8 length prefix
+		bindersLen += 1 // uint8 length prefix for each binder
 		bindersLen += len(binder)
 	}
 
-	fullMessage, err := m.marshalExpandedECH(outerExts)
+	fullMessage, err := m.marshalExpandedECH(outerExts, outerExtRawBytes, outerSessionId)
 	if err != nil {
 		return nil, err
 	}
-	// Strip binders from the end
-	return fullMessage[:len(fullMessage)-bindersLen], nil
+
+	// Strip binders from the end, but keep all length fields as-is
+	truncatedMessage := fullMessage[:len(fullMessage)-bindersLen]
+
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		fmt.Printf("[ECH DEBUG] Truncated message for binder:\n")
+		fmt.Printf("  Full len: %d, Stripped binders: %d, Truncated len: %d\n",
+			len(fullMessage), bindersLen, len(truncatedMessage))
+		// Show the header length (should still reflect full message)
+		headerLen := int(truncatedMessage[1])<<16 | int(truncatedMessage[2])<<8 | int(truncatedMessage[3])
+		fmt.Printf("  Header len field: %d (unchanged, per RFC 8446)\n", headerLen)
+		// Parse and show session_id from the truncated message
+		if len(truncatedMessage) > 38 {
+			sessionIdLen := int(truncatedMessage[38])
+			fmt.Printf("  Session_id in truncated msg: len=%d\n", sessionIdLen)
+			if sessionIdLen > 0 && len(truncatedMessage) > 38+1+sessionIdLen {
+				fmt.Printf("  Session_id bytes: %x\n", truncatedMessage[39:39+sessionIdLen])
+			}
+		}
+		// Print first 100 bytes to verify header structure
+		firstBytes := truncatedMessage
+		if len(firstBytes) > 100 {
+			firstBytes = firstBytes[:100]
+		}
+		fmt.Printf("  First %d bytes of truncated msg: %x\n", len(firstBytes), firstBytes)
+		// Print last 50 bytes to verify PSK identities end
+		lastBytes := truncatedMessage
+		if len(lastBytes) > 50 {
+			lastBytes = lastBytes[len(lastBytes)-50:]
+		}
+		fmt.Printf("  Last %d bytes of truncated msg: %x\n", len(lastBytes), lastBytes)
+	}
+
+	return truncatedMessage, nil
 }
 
 // marshalExpandedECH marshals the inner ClientHello in the format that results
 // after the server expands ech_outer_extensions references.
 // Extension order: ECH inner marker, server_name, [outer ext order], supported_versions, PSK
-func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16) ([]byte, error) {
+// The outerExtRawBytes parameter contains the raw bytes of each extension from the outer hello.
+// The outerSessionId parameter is the session_id from the outer ClientHello - per ECH spec,
+// the server copies this to the expanded inner hello.
+// Using raw bytes ensures byte-identical expansion to what the server computes.
+func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16, outerExtRawBytes map[uint16][]byte, outerSessionId []byte) ([]byte, error) {
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		fmt.Printf("[ECH DEBUG] marshalExpandedECH called with outerExts: %v\n", outerExts)
+	}
 	var exts cryptobyte.Builder
 
 	// 1. ECH inner marker - ALWAYS first (same as compressed format)
@@ -707,7 +730,7 @@ func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16) ([]byte, error) 
 		})
 	}
 
-	// 2. server_name - ALWAYS second (with real domain)
+	// 2. server_name - ALWAYS second (with real domain from inner, not outer)
 	if len(m.serverName) > 0 {
 		exts.AddUint16(extensionServerName)
 		exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
@@ -720,29 +743,58 @@ func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16) ([]byte, error) 
 		})
 	}
 
-	// 3. Extensions in outer hello order (these would have been in ech_outer_extensions)
-	// Iterate through outer extensions and add the ones that are compressible
-	greaseCount := 0
+	// 3. Extensions from ech_outer_extensions (must match compressed inner's order)
+	// The compressed inner builds echOuterExts by iterating outerExts in order,
+	// so we must iterate in the same order here for the binder to match.
+	// We use the raw bytes from the outer hello to ensure byte-identical expansion.
+	var expandedExtsOrder []uint16 // Debug: track order of emitted extensions
 	for _, extType := range outerExts {
-		// Handle GREASE extensions (pattern: extType&0x0f0f == 0x0a0a)
-		// Chrome includes GREASE at start (empty body) and end (0x00 body) of extensions
-		if extType&0x0f0f == 0x0a0a {
-			exts.AddUint16(extType)
-			if greaseCount == 0 {
-				// First GREASE: empty body
-				exts.AddUint16(0) // length = 0
-			} else {
-				// Second GREASE: single zero byte
-				exts.AddUint16(1)  // length = 1
-				exts.AddUint8(0)   // data = 0x00
-			}
-			greaseCount++
+		// Skip extensions that are NOT in ech_outer_extensions
+		switch extType {
+		case extensionServerName, extensionEncryptedClientHello, extensionPreSharedKey:
+			// These are serialized directly in inner hello, not via ech_outer_extensions
 			continue
 		}
-		switch extType {
-		case extensionServerName, extensionEncryptedClientHello, extensionSupportedVersions, extensionPreSharedKey:
-			// These are NOT compressed via ech_outer_extensions
+
+		// Check if this extension type is included in ech_outer_extensions
+		// (same logic as marshalMsgReorderOuterExts)
+		isCompressible := false
+		if extType&0x0f0f == 0x0a0a {
+			// GREASE extensions are compressible
+			isCompressible = true
+		} else {
+			switch extType {
+			case extensionPSKModes, extensionSupportedCurves, extensionALPN, extensionSignatureAlgorithms,
+				extensionQUICTransportParameters, extensionKeyShare, extensionRenegotiationInfo,
+				extensionSCT, extensionSupportedPoints, extensionSessionTicket, extensionStatusRequest,
+				extensionExtendedMasterSecret, extensionSignatureAlgorithmsCert,
+				// Chrome includes these via ech_outer_extensions
+				utlsExtensionCompressCertificate, utlsExtensionApplicationSettings, utlsExtensionApplicationSettingsNew,
+				extensionSupportedVersions, extensionEarlyData:
+				isCompressible = true
+			}
+		}
+
+		if !isCompressible {
 			continue
+		}
+
+		// Use raw bytes from outer hello if available
+		if rawBytes, ok := outerExtRawBytes[extType]; ok {
+			if os.Getenv("UTLS_ECH_DEBUG") != "" {
+				previewLen := 16
+				if len(rawBytes) < previewLen {
+					previewLen = len(rawBytes)
+				}
+				fmt.Printf("[ECH DEBUG] Using raw bytes for ext %d (0x%04x), len=%d, first %d bytes: %x\n", extType, extType, len(rawBytes), previewLen, rawBytes[:previewLen])
+			}
+			expandedExtsOrder = append(expandedExtsOrder, extType)
+			exts.AddBytes(rawBytes)
+			continue
+		}
+
+		// Fallback: re-serialize from struct fields (should not happen if caller provides raw bytes)
+		switch extType {
 		case extensionPSKModes:
 			if len(m.pskModes) > 0 {
 				exts.AddUint16(extensionPSKModes)
@@ -819,9 +871,6 @@ func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16) ([]byte, error) 
 					exts.AddBytes(m.quicTransportParameters)
 				})
 			}
-		// Note: utlsExtensionCompressCertificate is NOT handled here because
-		// clientHelloMsg doesn't store compress_certificate data.
-		// This extension should be removed from ech_outer_extensions.
 		case extensionRenegotiationInfo:
 			if m.secureRenegotiationSupported {
 				exts.AddUint16(extensionRenegotiationInfo)
@@ -866,54 +915,30 @@ func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16) ([]byte, error) 
 				exts.AddUint16(extensionExtendedMasterSecret)
 				exts.AddUint16(0) // empty extension_data
 			}
-		case utlsExtensionApplicationSettings, utlsExtensionApplicationSettingsNew:
-			if len(m.alpnProtocols) > 0 {
-				exts.AddUint16(extType)
-				exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
-					exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
-						for _, proto := range m.alpnProtocols {
-							exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
-								exts.AddBytes([]byte(proto))
-							})
-						}
-					})
-				})
-			}
-		// Note: extensionEarlyData is handled inline below, not via ech_outer_extensions
-		// since early_data must be in inner hello only (not in outer hello)
-		}
-	}
-
-	// 4. supported_versions - always inline (not via ech_outer_extensions)
-	if len(m.supportedVersions) > 0 {
-		var tls13Versions []uint16
-		for _, vers := range m.supportedVersions {
-			// Keep GREASE and TLS 1.3 only for ECH inner
-			if vers == VersionTLS13 || vers&0x0f0f == 0x0a0a {
-				tls13Versions = append(tls13Versions, vers)
+		default:
+			// Handle GREASE extensions
+			if extType&0x0f0f == 0x0a0a {
+				// GREASE extension - use raw bytes if available, otherwise skip
+				// (we shouldn't reach here if raw bytes are provided)
 			}
 		}
-		if len(tls13Versions) > 0 {
-			exts.AddUint16(extensionSupportedVersions)
-			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
-				exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
-					for _, vers := range tls13Versions {
-						exts.AddUint16(vers)
-					}
-				})
-			})
-		}
 	}
 
-	// 5. early_data - inline (not via ech_outer_extensions)
-	// Per ECH spec: early_data MUST be in inner hello, NOT in outer hello
-	if m.earlyData {
-		exts.AddUint16(extensionEarlyData)
-		exts.AddUint16(0) // empty extension_data
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		fmt.Printf("[ECH DEBUG] Expanded inner exts order: %v\n", expandedExtsOrder)
 	}
 
-	// 6. pre_shared_key - MUST be last extension (RFC 8446)
+	// 4. supported_versions and early_data come via ech_outer_extensions (not inline)
+	// Chrome references them from outer hello via ech_outer_extensions
+
+	// 5. pre_shared_key - MUST be last extension (RFC 8446)
 	if len(m.pskIdentities) > 0 {
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG] PSK in expanded format: identities=%d, binders=%d\n", len(m.pskIdentities), len(m.pskBinders))
+			for i, id := range m.pskIdentities {
+				fmt.Printf("[ECH DEBUG]   identity[%d]: label_len=%d, ticket_age=0x%08x\n", i, len(id.label), id.obfuscatedTicketAge)
+			}
+		}
 		exts.AddUint16(extensionPreSharedKey)
 		exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
 			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
@@ -946,8 +971,10 @@ func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16) ([]byte, error) 
 		b.AddUint16(VersionTLS12) // legacy_version
 		b.AddBytes(m.random[:])
 		b.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {
-			// For ECH inner, session_id should be empty (per spec)
-			// but we follow what the compressed format uses
+			// Per ECH spec: When the server decodes the inner ClientHello, it
+			// "copies the legacy_session_id field from ClientHelloOuter".
+			// So we must use the outer session_id for binder calculation.
+			b.AddBytes(outerSessionId)
 		})
 		b.AddUint16LengthPrefixed(func(b *cryptobyte.Builder) {
 			for _, suite := range m.cipherSuites {

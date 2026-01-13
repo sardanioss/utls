@@ -429,10 +429,12 @@ func (c *Conn) quicResumeSession(session *SessionState) error {
 }
 
 func (c *Conn) quicStoreSession(session *SessionState) {
+	fmt.Printf("[DEBUG utls] quicStoreSession: session=%v, quicNil=%v\n", session != nil, c.quic == nil)
 	c.quic.events = append(c.quic.events, QUICEvent{
 		Kind:         QUICStoreSession,
 		SessionState: session,
 	})
+	fmt.Printf("[DEBUG utls] quicStoreSession: event appended, events len=%d\n", len(c.quic.events))
 }
 
 func (c *Conn) quicSetTransportParameters(params []byte) {

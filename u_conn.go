@@ -109,6 +109,9 @@ func (uconn *UConn) BuildHandshakeStateWithoutSession() error {
 }
 
 func (uconn *UConn) buildHandshakeState(loadSession bool) error {
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		fmt.Printf("[ECH DEBUG buildHandshakeState] uconn=%p, loadSession=%v, clientHelloBuildStatus=%d\n", uconn, loadSession, uconn.clientHelloBuildStatus)
+	}
 	if uconn.ClientHelloID == HelloGolang {
 		if uconn.clientHelloBuildStatus == BuildByGoTLS {
 			return nil
@@ -150,9 +153,13 @@ func (uconn *UConn) buildHandshakeState(loadSession bool) error {
 			}
 		}
 
-		err = uconn.MarshalClientHello()
-		if err != nil {
-			return err
+		// Only marshal ClientHello if not already built
+		// This prevents overwriting ech.innerHello (with PSK data) on subsequent calls
+		if uconn.clientHelloBuildStatus != BuildByUtls {
+			err = uconn.MarshalClientHello()
+			if err != nil {
+				return err
+			}
 		}
 
 		if loadSession {
@@ -168,18 +175,42 @@ func (uconn *UConn) buildHandshakeState(loadSession bool) error {
 
 func (uconn *UConn) uLoadSession() error {
 	if cfg := uconn.config; cfg.SessionTicketsDisabled || cfg.ClientSessionCache == nil {
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG uLoadSession] uconn=%p: SessionTicketsDisabled=%v, cacheNil=%v - skipping\n",
+				uconn, cfg.SessionTicketsDisabled, cfg.ClientSessionCache == nil)
+		}
 		return nil
 	}
-	switch uconn.sessionController.shouldLoadSession() {
+	shouldLoad := uconn.sessionController.shouldLoadSession()
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		fmt.Printf("[ECH DEBUG uLoadSession] uconn=%p: shouldLoadSession=%d\n", uconn, shouldLoad)
+	}
+	switch shouldLoad {
 	case shouldReturn:
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG uLoadSession] uconn=%p: case shouldReturn\n", uconn)
+		}
 	case shouldSetTicket:
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG uLoadSession] uconn=%p: case shouldSetTicket\n", uconn)
+		}
 		uconn.sessionController.setSessionTicketToUConn()
 	case shouldSetPsk:
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG uLoadSession] uconn=%p: case shouldSetPsk\n", uconn)
+		}
 		uconn.sessionController.setPskToUConn()
 	case shouldLoad:
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG uLoadSession] uconn=%p: case shouldLoad\n", uconn)
+		}
 		hello := uconn.HandshakeState.Hello.getPrivatePtr()
 		uconn.sessionController.utlsAboutToLoadSession()
 		session, earlySecret, binderKey, err := uconn.loadSession(hello)
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG uLoadSession] uconn=%p: loadSession returned session=%v, err=%v\n",
+				uconn, session != nil, err)
+		}
 		if session == nil || err != nil {
 			return err
 		}
@@ -188,6 +219,9 @@ func (uconn *UConn) uLoadSession() error {
 			uconn.sessionController.initSessionTicketExt(session, hello.sessionTicket)
 			uconn.sessionController.setSessionTicketToUConn()
 		} else {
+			if os.Getenv("UTLS_ECH_DEBUG") != "" {
+				fmt.Printf("[ECH DEBUG uLoadSession] uconn=%p: initPskExt with TLS 1.3 session\n", uconn)
+			}
 			uconn.sessionController.initPskExt(session, earlySecret, binderKey, hello.pskIdentities)
 		}
 	}
@@ -509,12 +543,24 @@ func (uconn *UConn) extensionsList() []uint16 {
 
 func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech *echClientContext, useKey bool) error {
 	// Use the current extensions list
-	return uconn.computeAndUpdateOuterECHExtensionWithOuterExts(inner, ech, useKey, uconn.extensionsList())
+	return uconn.computeAndUpdateOuterECHExtensionWithOuterExts(inner, ech, useKey, uconn.extensionsList(), nil)
 }
 
-func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *clientHelloMsg, ech *echClientContext, useKey bool, outerExts []uint16) error {
+func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *clientHelloMsg, ech *echClientContext, useKey bool, outerExts []uint16, pskExt *UtlsPreSharedKeyExtension) error {
 	// This function is mostly copied from
 	// https://github.com/sardanioss/utls/blob/e430876b1d82fdf582efc57f3992d448e7ab3d8a/ech.go#L408
+
+	// For PSK requests, Chrome includes early_data in ech_outer_extensions
+	// Only filter early_data for non-PSK requests
+	if pskExt == nil {
+		filteredOuterExts := make([]uint16, 0, len(outerExts))
+		for _, extType := range outerExts {
+			if extType != extensionEarlyData {
+				filteredOuterExts = append(filteredOuterExts, extType)
+			}
+		}
+		outerExts = filteredOuterExts
+	}
 
 	if os.Getenv("UTLS_ECH_DEBUG") != "" {
 		fmt.Printf("[ECH DEBUG] === computeAndUpdateOuterECHExtension START ===\n")
@@ -568,12 +614,80 @@ func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *client
 		Data: outerECHExt,
 	}
 
+	// Chrome keeps early_data in outer hello, and inner references it via ech_outer_extensions
+	// Do NOT remove FakeEarlyDataExtension from outer hello
+
 	if err := uconn.MarshalClientHelloNoECH(); err != nil {
 		return err
 	}
 
 	serializedOuter := uconn.HandshakeState.Hello.Raw
 	serializedOuter = serializedOuter[4:]
+
+	// If PSK extension is provided, recalculate binder using bytes from serialized outer hello
+	// This ensures binder is calculated over the EXACT bytes the server will see
+	if pskExt != nil && pskExt.cipherSuite != nil && len(pskExt.BinderKey) > 0 {
+		// Extract extension bytes from the serialized outer hello
+		outerExtRawBytes := extractExtensionBytesFromHello(serializedOuter)
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG] PSK binder recalculation using serialized outer bytes:\n")
+			fmt.Printf("[ECH DEBUG]   Extracted %d extensions from serialized outer\n", len(outerExtRawBytes))
+		}
+
+		// Get outer session_id - per ECH spec, server copies this to expanded inner hello
+		outerSessionId := uconn.HandshakeState.Hello.SessionId
+
+		// Calculate binder using the ACTUAL bytes from serialized outer
+		helloBytes, err := inner.marshalExpandedECHWithoutBinders(outerExts, outerExtRawBytes, outerSessionId)
+		if err != nil {
+			return fmt.Errorf("failed to marshal inner hello for PSK binder recalculation: %w", err)
+		}
+
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			debugLen := len(helloBytes)
+			if debugLen > 100 {
+				debugLen = 100
+			}
+			fmt.Printf("[ECH DEBUG]   Expanded inner for binder (len=%d): %x...\n", len(helloBytes), helloBytes[:debugLen])
+		}
+
+		// Calculate binder
+		transcript := pskExt.cipherSuite.hash.New()
+		transcript.Write(helloBytes)
+		innerBinders := [][]byte{pskExt.cipherSuite.finishedHash(pskExt.BinderKey, transcript)}
+
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG]   Recalculated PSK binder: %x\n", innerBinders[0])
+		}
+
+		// Update inner hello's binders
+		inner.pskBinders = innerBinders
+
+		// Re-encode inner hello with the correct binders
+		encodedInner, err = encodeInnerClientHelloReorderOuterExts(inner, int(ech.config.MaxNameLength), outerExts)
+		if err != nil {
+			return fmt.Errorf("failed to re-encode inner hello after PSK binder recalculation: %w", err)
+		}
+
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG]   Re-encoded inner hello length: %d bytes\n", len(encodedInner))
+		}
+
+		// Store the encoded (compressed) inner hello for use in echTranscriptMsg
+		// This ensures we decode the EXACT same bytes the server received
+		ech.encodedInnerHello = encodedInner
+
+		// Store the full expanded inner hello (WITH binders) for early traffic secret calculation
+		// This ensures we use the EXACT same bytes as the PSK binder calculation
+		fullExpandedInner, err := inner.marshalExpandedECH(outerExts, outerExtRawBytes, outerSessionId)
+		if err != nil {
+			return fmt.Errorf("failed to marshal full expanded inner hello: %w", err)
+		}
+		ech.expandedInnerHello = fullExpandedInner
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG]   Stored expanded inner hello (with binders) for early traffic: len=%d\n", len(fullExpandedInner))
+		}
+	}
 
 	// Debug: print outer hello SNI
 	if os.Getenv("UTLS_ECH_DEBUG") != "" {
@@ -619,8 +733,43 @@ func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *client
 		fmt.Printf("[ECH DEBUG] === HPKE Seal Operation ===\n")
 		fmt.Printf("[ECH DEBUG]   AAD (serializedOuter) length: %d bytes\n", len(serializedOuter))
 		fmt.Printf("[ECH DEBUG]   Plaintext (encodedInner) length: %d bytes\n", len(encodedInner))
+
+		// Dump FULL encodedInner (plaintext being encrypted)
+		fmt.Printf("\n[ECH DEBUG] === FULL ENCODED INNER (PLAINTEXT) ===\n")
+		for i := 0; i < len(encodedInner); i += 64 {
+			end := i + 64
+			if end > len(encodedInner) {
+				end = len(encodedInner)
+			}
+			fmt.Printf("[INNER %04d-%04d] %x\n", i, end, encodedInner[i:end])
+		}
+		fmt.Printf("[ECH DEBUG] === END ENCODED INNER ===\n\n")
+
 		if len(serializedOuter) > 32 {
 			fmt.Printf("[ECH DEBUG]   AAD (first 32): %x\n", serializedOuter[:32])
+		}
+		// Print session_id from serialized outer (at offset 34)
+		if len(serializedOuter) > 34 {
+			outerSessionIdLen := int(serializedOuter[34])
+			fmt.Printf("[ECH DEBUG]   Outer hello session_id len (in AAD): %d\n", outerSessionIdLen)
+			if outerSessionIdLen > 0 && len(serializedOuter) > 35+outerSessionIdLen {
+				fmt.Printf("[ECH DEBUG]   Outer hello session_id (in AAD): %x\n", serializedOuter[35:35+outerSessionIdLen])
+			}
+		}
+		// Extract and print key extension bytes from serialized outer for comparison
+		// This helps verify if captured raw bytes match what's actually in the outer hello
+		outerExtMap := extractExtensionBytesFromHello(serializedOuter)
+		fmt.Printf("[ECH DEBUG]   Extracted %d extensions from serialized outer hello\n", len(outerExtMap))
+		// Print first 16 bytes of key extensions for comparison
+		for _, extType := range []uint16{51, 10, 13, 45, 57, 16} { // key_share, curves, sig_algs, psk_modes, quic, alpn
+			if bytes, ok := outerExtMap[extType]; ok {
+				previewLen := 16
+				if len(bytes) < previewLen {
+					previewLen = len(bytes)
+				}
+				fmt.Printf("[ECH DEBUG]   Outer ext %d (0x%04x) in AAD: len=%d, first %d bytes: %x\n",
+					extType, extType, len(bytes), previewLen, bytes[:previewLen])
+			}
 		}
 	}
 
@@ -645,6 +794,35 @@ func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *client
 		Data: outerECHExt,
 	}
 
+	// Chrome keeps early_data in outer hello for PSK, and inner references it via ech_outer_extensions
+	// Do NOT remove FakeEarlyDataExtension from outer hello
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		edIdx := -1
+		for i, ext := range uconn.Extensions {
+			if _, ok := ext.(*FakeEarlyDataExtension); ok {
+				edIdx = i
+				break
+			}
+		}
+		fmt.Printf("[ECH DEBUG] FakeEarlyDataExtension in outer hello at idx=%d (keeping for ech_outer_extensions)\n", edIdx)
+	}
+
+	// Debug: print all outer extension types before final marshal
+	// Store serializedOuter (first marshal AAD) for comparison
+	firstMarshalAAD := make([]byte, len(serializedOuter))
+	copy(firstMarshalAAD, serializedOuter)
+
+	if os.Getenv("UTLS_ECH_DEBUG") != "" {
+		var outerExtTypes []uint16
+		for _, ext := range uconn.Extensions {
+			buffer := make([]byte, 2000)
+			ext.Read(buffer)
+			extType := uint16(buffer[0])<<8 | uint16(buffer[1])
+			outerExtTypes = append(outerExtTypes, extType)
+		}
+		fmt.Printf("[ECH DEBUG] Outer extension types for final marshal: %v\n", outerExtTypes)
+	}
+
 	if err := uconn.MarshalClientHelloNoECH(); err != nil {
 		return err
 	}
@@ -652,6 +830,184 @@ func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *client
 	if os.Getenv("UTLS_ECH_DEBUG") != "" {
 		fmt.Printf("[ECH DEBUG] === computeAndUpdateOuterECHExtension DONE ===\n")
 		fmt.Printf("[ECH DEBUG]   Final outer hello length: %d bytes\n", len(uconn.HandshakeState.Hello.Raw))
+
+		// CRITICAL: Compare AAD (first marshal) with what server would compute
+		// Server takes received hello (second marshal) and zeros ECH payload
+		finalMarshal := uconn.HandshakeState.Hello.Raw[4:] // Skip header
+
+		// Find ECH extension in both marshals and compare EVERYTHING
+		fmt.Printf("\n[ECH DEBUG] ============ COMPREHENSIVE AAD COMPARISON ============\n")
+		fmt.Printf("[ECH DEBUG] First marshal (AAD for HPKE Seal): %d bytes\n", len(firstMarshalAAD))
+		fmt.Printf("[ECH DEBUG] Second marshal (sent to server):  %d bytes\n", len(finalMarshal))
+
+		// Dump FULL first marshal AAD
+		fmt.Printf("\n[ECH DEBUG] === FULL FIRST MARSHAL (AAD) ===\n")
+		for i := 0; i < len(firstMarshalAAD); i += 64 {
+			end := i + 64
+			if end > len(firstMarshalAAD) {
+				end = len(firstMarshalAAD)
+			}
+			fmt.Printf("[AAD %04d-%04d] %x\n", i, end, firstMarshalAAD[i:end])
+		}
+
+		// Dump FULL second marshal
+		fmt.Printf("\n[ECH DEBUG] === FULL SECOND MARSHAL (SENT) ===\n")
+		for i := 0; i < len(finalMarshal); i += 64 {
+			end := i + 64
+			if end > len(finalMarshal) {
+				end = len(finalMarshal)
+			}
+			fmt.Printf("[SENT %04d-%04d] %x\n", i, end, finalMarshal[i:end])
+		}
+
+		// Find ECH extension in both and create "server view" (with payload zeroed)
+		findECHExtension := func(data []byte) (offset, headerLen, payloadLen int, found bool) {
+			if len(data) < 38 {
+				return 0, 0, 0, false
+			}
+			off := 34 // version(2) + random(32)
+			sessionIdLen := int(data[off])
+			off += 1 + sessionIdLen
+			if off+2 > len(data) {
+				return 0, 0, 0, false
+			}
+			cipherSuitesLen := int(data[off])<<8 | int(data[off+1])
+			off += 2 + cipherSuitesLen
+			if off+1 > len(data) {
+				return 0, 0, 0, false
+			}
+			compressionLen := int(data[off])
+			off += 1 + compressionLen
+			if off+2 > len(data) {
+				return 0, 0, 0, false
+			}
+			extensionsLen := int(data[off])<<8 | int(data[off+1])
+			off += 2
+			endOff := off + extensionsLen
+			for off+4 <= len(data) && off < endOff {
+				extType := int(data[off])<<8 | int(data[off+1])
+				extLen := int(data[off+2])<<8 | int(data[off+3])
+				if extType == 0xfe0d { // ECH extension
+					// ECH format: type(1) + kdf(2) + aead(2) + config_id(1) + enc_len(2) + enc(enc_len) + payload_len(2) + payload
+					if off+4+extLen <= len(data) && extLen > 8 {
+						echData := data[off+4 : off+4+extLen]
+						encLen := int(echData[6])<<8 | int(echData[7])
+						if 8+encLen+2 <= len(echData) {
+							pLen := int(echData[8+encLen])<<8 | int(echData[8+encLen+1])
+							hLen := 8 + encLen + 2 // header length (everything before payload)
+							return off + 4, hLen, pLen, true
+						}
+					}
+				}
+				off += 4 + extLen
+			}
+			return 0, 0, 0, false
+		}
+
+		echOff1, hdrLen1, payloadLen1, found1 := findECHExtension(firstMarshalAAD)
+		echOff2, hdrLen2, payloadLen2, found2 := findECHExtension(finalMarshal)
+
+		fmt.Printf("\n[ECH DEBUG] === ECH EXTENSION LOCATIONS ===\n")
+		fmt.Printf("[ECH DEBUG] First marshal:  found=%v, offset=%d, headerLen=%d, payloadLen=%d\n", found1, echOff1, hdrLen1, payloadLen1)
+		fmt.Printf("[ECH DEBUG] Second marshal: found=%v, offset=%d, headerLen=%d, payloadLen=%d\n", found2, echOff2, hdrLen2, payloadLen2)
+
+		if found1 && found2 {
+			// Compare ECH headers (should be identical)
+			echHeader1 := firstMarshalAAD[echOff1 : echOff1+hdrLen1]
+			echHeader2 := finalMarshal[echOff2 : echOff2+hdrLen2]
+			fmt.Printf("\n[ECH DEBUG] === ECH HEADER COMPARISON ===\n")
+			fmt.Printf("[ECH DEBUG] First ECH header (%d bytes):  %x\n", len(echHeader1), echHeader1)
+			fmt.Printf("[ECH DEBUG] Second ECH header (%d bytes): %x\n", len(echHeader2), echHeader2)
+
+			headerMatch := len(echHeader1) == len(echHeader2)
+			if headerMatch {
+				for i := range echHeader1 {
+					if echHeader1[i] != echHeader2[i] {
+						headerMatch = false
+						break
+					}
+				}
+			}
+			fmt.Printf("[ECH DEBUG] ECH headers match: %v\n", headerMatch)
+
+			// Compare ECH payloads
+			echPayload1 := firstMarshalAAD[echOff1+hdrLen1 : echOff1+hdrLen1+payloadLen1]
+			echPayload2 := finalMarshal[echOff2+hdrLen2 : echOff2+hdrLen2+payloadLen2]
+			fmt.Printf("\n[ECH DEBUG] === ECH PAYLOAD INFO ===\n")
+			fmt.Printf("[ECH DEBUG] First ECH payload len:  %d (should be all zeros)\n", len(echPayload1))
+			fmt.Printf("[ECH DEBUG] Second ECH payload len: %d (encrypted)\n", len(echPayload2))
+
+			// Verify first payload is all zeros
+			allZeros := true
+			for _, b := range echPayload1 {
+				if b != 0 {
+					allZeros = false
+					break
+				}
+			}
+			fmt.Printf("[ECH DEBUG] First payload all zeros: %v\n", allZeros)
+
+			// Create "server view" - second marshal with ECH payload zeroed
+			serverView := make([]byte, len(finalMarshal))
+			copy(serverView, finalMarshal)
+			for i := 0; i < payloadLen2; i++ {
+				serverView[echOff2+hdrLen2+i] = 0
+			}
+
+			// Compare firstMarshalAAD with serverView byte-by-byte
+			fmt.Printf("\n[ECH DEBUG] === BYTE-BY-BYTE AAD vs SERVER VIEW COMPARISON ===\n")
+			if len(firstMarshalAAD) != len(serverView) {
+				fmt.Printf("[ECH DEBUG] LENGTH MISMATCH! AAD=%d, ServerView=%d\n", len(firstMarshalAAD), len(serverView))
+			} else {
+				differences := 0
+				for i := range firstMarshalAAD {
+					if firstMarshalAAD[i] != serverView[i] {
+						differences++
+						if differences <= 20 {
+							fmt.Printf("[ECH DEBUG] DIFF at byte %d: AAD=%02x, ServerView=%02x\n", i, firstMarshalAAD[i], serverView[i])
+						}
+					}
+				}
+				if differences == 0 {
+					fmt.Printf("[ECH DEBUG] AAD and ServerView are IDENTICAL!\n")
+				} else {
+					fmt.Printf("[ECH DEBUG] Total differences: %d bytes\n", differences)
+				}
+			}
+		}
+
+		fmt.Printf("[ECH DEBUG] ============ END AAD COMPARISON ============\n\n")
+
+		// Old ext 57 comparison
+		firstExt57 := extractExtensionBytesFromHello(firstMarshalAAD)
+		secondExt57 := extractExtensionBytesFromHello(finalMarshal)
+		if ext57First, ok1 := firstExt57[57]; ok1 {
+			if ext57Second, ok2 := secondExt57[57]; ok2 {
+				if len(ext57First) != len(ext57Second) {
+					fmt.Printf("[ECH DEBUG] WARNING: Ext 57 LENGTH MISMATCH between marshals! first=%d, second=%d\n",
+						len(ext57First), len(ext57Second))
+				} else {
+					match := true
+					for i := range ext57First {
+						if ext57First[i] != ext57Second[i] {
+							match = false
+							break
+						}
+					}
+					if !match {
+						fmt.Printf("[ECH DEBUG] WARNING: Ext 57 BYTES MISMATCH between marshals!\n")
+						previewLen := 16
+						if len(ext57First) < previewLen {
+							previewLen = len(ext57First)
+						}
+						fmt.Printf("[ECH DEBUG]   First marshal:  %x\n", ext57First[:previewLen])
+						fmt.Printf("[ECH DEBUG]   Second marshal: %x\n", ext57Second[:previewLen])
+					} else {
+						fmt.Printf("[ECH DEBUG]   Ext 57 matches between first and second marshal (len=%d)\n", len(ext57First))
+					}
+				}
+			}
+		}
 
 		// Find and print the ECH extension bytes
 		raw := uconn.HandshakeState.Hello.Raw
@@ -767,6 +1123,11 @@ func (uconn *UConn) MarshalClientHello() error {
 		inner.secureRenegotiationSupported = uconn.HandshakeState.Hello.SecureRenegotiationSupported
 		inner.secureRenegotiation = uconn.HandshakeState.Hello.SecureRenegotiation
 
+		// Per ECH spec: early_data MUST be in inner hello only, NOT in outer hello
+		// The inner already has earlyData copied above, now clear it from outer
+		// This prevents the outer ClientHello from including the early_data extension
+		uconn.HandshakeState.Hello.EarlyData = false
+
 		// For PSK with ECH: get PSK data from the extension and recalculate binders for inner hello
 		// The outer hello's binders were calculated over the outer transcript, but the server
 		// will verify binders against the inner ClientHello transcript after decrypting ECH
@@ -811,6 +1172,13 @@ func (uconn *UConn) MarshalClientHello() error {
 				}
 			}
 
+			if os.Getenv("UTLS_ECH_DEBUG") != "" {
+				fmt.Printf("[ECH DEBUG] PSK extension from outer: identities=%d, binders=%d\n", len(pskExt.Identities), len(pskExt.Binders))
+				for i, id := range pskExt.Identities {
+					fmt.Printf("[ECH DEBUG]   outer identity[%d]: label_len=%d, ticket_age=0x%08x\n", i, len(id.Label), id.ObfuscatedTicketAge)
+				}
+			}
+
 			// Copy PSK identities from the extension to inner hello
 			inner.pskIdentities = PskIdentities(pskExt.Identities).ToPrivate()
 
@@ -824,31 +1192,12 @@ func (uconn *UConn) MarshalClientHello() error {
 			// The server expands ech_outer_extensions and verifies the binder over that format
 			// We must use the same extension order as the outer hello
 			outerExtsList = uconn.extensionsList()
-			helloBytes, err := inner.marshalExpandedECHWithoutBinders(outerExtsList)
-			if err != nil {
-				return fmt.Errorf("failed to marshal inner hello for PSK binder: %w", err)
-			}
+			// Chrome reference: early_data (42) IS included in both outer hello AND ech_outer_extensions for PSK
+			// The inner hello references early_data via ech_outer_extensions (not inline)
 
-			if os.Getenv("UTLS_ECH_DEBUG") != "" {
-				debugLen := len(helloBytes)
-				if debugLen > 100 {
-					debugLen = 100
-				}
-				fmt.Printf("[ECH DEBUG] Inner hello for PSK binder (len=%d): %x...\n", len(helloBytes), helloBytes[:debugLen])
-				fmt.Printf("[ECH DEBUG] Outer extension order: %v\n", outerExtsList)
-			}
-
-			// Calculate binder using inner hello's transcript (expanded format)
-			transcript := pskExt.cipherSuite.hash.New()
-			transcript.Write(helloBytes)
-			innerBinders := [][]byte{pskExt.cipherSuite.finishedHash(pskExt.BinderKey, transcript)}
-
-			if os.Getenv("UTLS_ECH_DEBUG") != "" {
-				fmt.Printf("[ECH DEBUG] Calculated PSK binder for inner: %x\n", innerBinders[0])
-			}
-
-			// Update inner hello's binders
-			inner.pskBinders = innerBinders
+			// NOTE: PSK binder calculation is now done INSIDE computeAndUpdateOuterECHExtensionWithOuterExts
+			// AFTER the outer hello is serialized, using bytes extracted from the serialized outer.
+			// This ensures the binder is calculated over the EXACT bytes the server will see.
 
 			// Now create GREASE PSK for the outer hello
 			// GREASE PSK has random identities and binders of the same length as the real ones
@@ -897,6 +1246,15 @@ func (uconn *UConn) MarshalClientHello() error {
 
 		ech.innerHello = inner
 
+		// Debug: verify PSK is in inner hello after assignment
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG] After ech.innerHello = inner:\n")
+			fmt.Printf("[ECH DEBUG]   inner.pskIdentities len: %d\n", len(inner.pskIdentities))
+			fmt.Printf("[ECH DEBUG]   ech.innerHello.pskIdentities len: %d\n", len(ech.innerHello.pskIdentities))
+			fmt.Printf("[ECH DEBUG]   inner ptr: %p, ech.innerHello ptr: %p\n", inner, ech.innerHello)
+			fmt.Printf("[ECH DEBUG]   uconn ptr: %p, clientHelloBuildStatus: %d\n", uconn, uconn.clientHelloBuildStatus)
+		}
+
 		// Debug: compare inner and outer random values
 		if os.Getenv("UTLS_ECH_DEBUG") != "" {
 			fmt.Printf("[ECH DEBUG] Inner random: %x\n", inner.random[:8])
@@ -935,7 +1293,10 @@ func (uconn *UConn) MarshalClientHello() error {
 		// instead of the GREASE PSK which has type 0 when reading from buffer
 		var echErr error
 		if outerExtsList != nil {
-			echErr = uconn.computeAndUpdateOuterECHExtensionWithOuterExts(inner, ech, true, outerExtsList)
+			if os.Getenv("UTLS_ECH_DEBUG") != "" {
+				fmt.Printf("[ECH DEBUG] Using outerExtsList for compressed inner: %v\n", outerExtsList)
+			}
+			echErr = uconn.computeAndUpdateOuterECHExtensionWithOuterExts(inner, ech, true, outerExtsList, pskExt)
 		} else {
 			echErr = uconn.computeAndUpdateOuterECHExtension(inner, ech, true)
 		}
@@ -950,6 +1311,10 @@ func (uconn *UConn) MarshalClientHello() error {
 		uconn.config.ServerName = originalServerName
 
 		uconn.echCtx = ech
+		if os.Getenv("UTLS_ECH_DEBUG") != "" {
+			fmt.Printf("[ECH DEBUG] Setting uconn.echCtx: uconn=%p, ech=%p, ech.innerHello=%p, pskIdentities=%d\n",
+				uconn, ech, ech.innerHello, len(ech.innerHello.pskIdentities))
+		}
 		return nil
 	}
 

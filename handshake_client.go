@@ -273,6 +273,14 @@ type echClientContext struct {
 	aeadID          uint16
 	echRejected     bool
 	retryConfigs    []byte
+	// expandedInnerHello contains the EXPANDED inner ClientHello bytes (with PSK binders)
+	// for early traffic secret calculation. This is computed during ECH setup using
+	// the exact same outerExtRawBytes as the PSK binder calculation.
+	expandedInnerHello []byte
+	// encodedInnerHello contains the ENCODED (compressed) inner ClientHello bytes
+	// that were actually sent to the server. This is used in echTranscriptMsg to
+	// ensure we decode the exact same bytes the server received.
+	encodedInnerHello []byte
 }
 
 func (c *Conn) clientHandshake(ctx context.Context) (err error) {
@@ -403,6 +411,7 @@ func (c *Conn) clientHandshake(ctx context.Context) (err error) {
 
 func (c *Conn) loadSession(hello *clientHelloMsg) (
 	session *SessionState, earlySecret *tls13.EarlySecret, binderKey []byte, err error) {
+	fmt.Printf("[DEBUG utls] loadSession called, ticketsDisabled=%v, cacheNil=%v, connPtr=%p, configPtr=%p\n", c.config.SessionTicketsDisabled, c.config.ClientSessionCache == nil, c, c.config)
 	// [UTLS SECTION START]
 	if c.utls.sessionController != nil {
 		c.utls.sessionController.onEnterLoadSessionCheck()
@@ -410,6 +419,7 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	}
 	// [UTLS SECTION END]
 	if c.config.SessionTicketsDisabled || c.config.ClientSessionCache == nil {
+		fmt.Printf("[DEBUG utls] loadSession: returning early (disabled or no cache)\n")
 		return nil, nil, nil, nil
 	}
 
@@ -434,11 +444,16 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 
 	// Try to resume a previously negotiated TLS session, if available.
 	cacheKey := c.clientSessionCacheKey()
+	fmt.Printf("[DEBUG utls] loadSession: cacheKey=%s\n", cacheKey)
 	if cacheKey == "" {
+		fmt.Printf("[DEBUG utls] loadSession: returning (empty cacheKey)\n")
 		return nil, nil, nil, nil
 	}
+	fmt.Printf("[DEBUG utls] loadSession: calling cache.Get(%s), cacheType=%T, cachePtr=%p\n", cacheKey, c.config.ClientSessionCache, c.config.ClientSessionCache)
 	cs, ok := c.config.ClientSessionCache.Get(cacheKey)
+	fmt.Printf("[DEBUG utls] loadSession: cache.Get returned ok=%v, csNil=%v\n", ok, cs == nil)
 	if !ok || cs == nil {
+		fmt.Printf("[DEBUG utls] loadSession: returning (no cached session)\n")
 		return nil, nil, nil, nil
 	}
 	session = cs.session

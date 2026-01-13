@@ -587,6 +587,53 @@ func extractExtensionTypes(hello []byte) []uint16 {
 	}
 	return exts
 }
+// extractExtensionBytesFromHello parses a ClientHello and returns a map of extension type to full extension bytes
+// (including type, length, and data)
+func extractExtensionBytesFromHello(hello []byte) map[uint16][]byte {
+	result := make(map[uint16][]byte)
+	if len(hello) < 38 {
+		return result
+	}
+	offset := 34 // version(2) + random(32)
+
+	// Skip session ID
+	sessionIDLen := int(hello[offset])
+	offset += 1 + sessionIDLen
+	if offset+2 > len(hello) {
+		return result
+	}
+
+	// Skip cipher suites
+	cipherLen := int(hello[offset])<<8 | int(hello[offset+1])
+	offset += 2 + cipherLen
+	if offset+1 > len(hello) {
+		return result
+	}
+
+	// Skip compression methods
+	compLen := int(hello[offset])
+	offset += 1 + compLen
+	if offset+2 > len(hello) {
+		return result
+	}
+
+	// Parse extensions
+	extLen := int(hello[offset])<<8 | int(hello[offset+1])
+	offset += 2
+	endOffset := offset + extLen
+
+	for offset+4 <= len(hello) && offset < endOffset {
+		extType := uint16(hello[offset])<<8 | uint16(hello[offset+1])
+		extDataLen := int(hello[offset+2])<<8 | int(hello[offset+3])
+		fullExtLen := 4 + extDataLen
+		if offset+fullExtLen <= len(hello) {
+			result[extType] = hello[offset : offset+fullExtLen]
+		}
+		offset += fullExtLen
+	}
+	return result
+}
+
 // [uTLS SECTION END]
 
 // validDNSName is a rather rudimentary check for the validity of a DNS name.
