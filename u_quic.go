@@ -87,9 +87,6 @@ func (q *UQUICConn) NextEvent() QUICEvent {
 		return QUICEvent{Kind: QUICNoEvent}
 	}
 	e := qs.events[qs.nextEvent]
-	if e.Kind == QUICStoreSession {
-		fmt.Printf("[DEBUG utls] NextEvent: returning QUICStoreSession, SessionState=%v\n", e.SessionState != nil)
-	}
 	qs.events[qs.nextEvent] = QUICEvent{} // zero out references to data
 	qs.nextEvent++
 	return e
@@ -177,17 +174,13 @@ func (q *UQUICConn) StoreSession(session *SessionState) error {
 		return quicError(errors.New("tls: StoreSessionTicket called on the server"))
 	}
 	cacheKey := c.clientSessionCacheKey()
-	fmt.Printf("[DEBUG utls] StoreSession: uquicConnPtr=%p, uconnPtr=%p, connPtr=%p, configPtr=%p, cachePtr=%p, cacheKey=%s\n", q, q.conn, c, c.config, c.config.ClientSessionCache, cacheKey)
 	if cacheKey == "" {
-		fmt.Printf("[DEBUG utls] StoreSession: returning early (empty cacheKey)\n")
 		return nil
 	}
 	if c.config.ClientSessionCache == nil {
-		fmt.Printf("[DEBUG utls] StoreSession: returning early (nil ClientSessionCache)\n")
 		return nil
 	}
 	cs := &ClientSessionState{session: session}
-	fmt.Printf("[DEBUG utls] StoreSession: storing session with earlyData=%v\n", session.EarlyData)
 	c.config.ClientSessionCache.Put(cacheKey, cs)
 	return nil
 }

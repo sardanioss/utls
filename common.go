@@ -20,8 +20,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -1682,16 +1680,6 @@ func NewLRUClientSessionCache(capacity int) ClientSessionCache {
 func (c *lruSessionCache) Put(sessionKey string, cs *ClientSessionState) {
 	c.Lock()
 	defer c.Unlock()
-
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		if cs == nil {
-			fmt.Printf("[DEBUG cache] Put(%s, nil) - REMOVING session\n", sessionKey)
-			// Print stack trace to see where this is called from
-			debug.PrintStack()
-		} else {
-			fmt.Printf("[DEBUG cache] Put(%s, session) - storing session\n", sessionKey)
-		}
-	}
 
 	if elem, ok := c.m[sessionKey]; ok {
 		if cs == nil {

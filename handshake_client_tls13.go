@@ -102,107 +102,22 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 		// Chrome-style PSK: Skip ECH confirmation check entirely.
 		// Server uses outer hello's PSK directly, ECH is not processed.
 		if hs.echContext.pskInOuterOnly {
-			fmt.Printf("\n[DEBUG ECH Confirm] ============ SKIPPING ECH CONFIRMATION (pskInOuterOnly) ============\n")
-			fmt.Printf("[DEBUG ECH Confirm] Chrome-style PSK: server uses outer hello, ECH bypassed\n")
 			hs.echContext.echRejected = true
 			// Continue with outer hello context - this is expected behavior
 		} else {
-			// Standard ECH confirmation check with COMPREHENSIVE DEBUG
-			fmt.Printf("\n[DEBUG ECH Confirm] ================================================================================\n")
-			fmt.Printf("[DEBUG ECH Confirm] ========================= ECH CONFIRMATION CHECK ================================\n")
-			fmt.Printf("[DEBUG ECH Confirm] ================================================================================\n")
-
-			// ===== SECTION 1: RANDOM VALUES =====
-			fmt.Printf("\n[DEBUG ECH Confirm] ===== SECTION 1: RANDOM VALUES =====\n")
-			fmt.Printf("[DEBUG ECH Confirm] innerHello.random (used for HKDF key):\n")
-			fmt.Printf("[DEBUG ECH Confirm]   FULL: %x\n", hs.echContext.innerHello.random)
-			fmt.Printf("[DEBUG ECH Confirm]   first8: %x, last8: %x\n", hs.echContext.innerHello.random[:8], hs.echContext.innerHello.random[24:])
-
-			fmt.Printf("[DEBUG ECH Confirm] outerHello.random (hs.hello.random):\n")
-			fmt.Printf("[DEBUG ECH Confirm]   FULL: %x\n", hs.hello.random)
-			fmt.Printf("[DEBUG ECH Confirm]   first8: %x, last8: %x\n", hs.hello.random[:8], hs.hello.random[24:])
-
-			innerOuterRandomMatch := bytes.Equal(hs.echContext.innerHello.random, hs.hello.random)
-			fmt.Printf("[DEBUG ECH Confirm] inner.random == outer.random? %v (should be FALSE for ECH)\n", innerOuterRandomMatch)
-
-			if len(hs.echContext.expandedInnerHello) > 37 {
-				embeddedRandom := hs.echContext.expandedInnerHello[6:38]
-				fmt.Printf("[DEBUG ECH Confirm] expandedInnerHello embedded random:\n")
-				fmt.Printf("[DEBUG ECH Confirm]   FULL: %x\n", embeddedRandom)
-				expandedMatchesInner := bytes.Equal(embeddedRandom, hs.echContext.innerHello.random)
-				fmt.Printf("[DEBUG ECH Confirm]   matches innerHello.random? %v (MUST be TRUE)\n", expandedMatchesInner)
-				if !expandedMatchesInner {
-					fmt.Printf("[DEBUG ECH Confirm]   !!! CRITICAL MISMATCH: expandedInnerHello has WRONG random !!!\n")
-				}
-			}
-
-			// ===== SECTION 2: TRANSCRIPT STATE =====
-			fmt.Printf("\n[DEBUG ECH Confirm] ===== SECTION 2: TRANSCRIPT STATE =====\n")
-			innerTranscriptHashBefore := hs.echContext.innerTranscript.Sum(nil)
-			outerTranscriptHashBefore := hs.transcript.Sum(nil)
-			fmt.Printf("[DEBUG ECH Confirm] innerTranscript hash (before SH): %x\n", innerTranscriptHashBefore)
-			fmt.Printf("[DEBUG ECH Confirm] outerTranscript hash (before SH): %x\n", outerTranscriptHashBefore)
-			fmt.Printf("[DEBUG ECH Confirm] inner == outer transcript? %v (should be FALSE)\n", bytes.Equal(innerTranscriptHashBefore, outerTranscriptHashBefore))
-
-			// ===== SECTION 3: SERVER HELLO STRUCTURE =====
-			fmt.Printf("\n[DEBUG ECH Confirm] ===== SECTION 3: SERVER HELLO STRUCTURE =====\n")
-			shLen := len(hs.serverHello.original)
-			fmt.Printf("[DEBUG ECH Confirm] serverHello.original length: %d bytes\n", shLen)
-			fmt.Printf("[DEBUG ECH Confirm] Structure breakdown:\n")
-			fmt.Printf("[DEBUG ECH Confirm]   [0]: msg_type = 0x%02x (expect 0x02 for ServerHello)\n", hs.serverHello.original[0])
-			fmt.Printf("[DEBUG ECH Confirm]   [1-3]: length = %d\n", int(hs.serverHello.original[1])<<16|int(hs.serverHello.original[2])<<8|int(hs.serverHello.original[3]))
-			fmt.Printf("[DEBUG ECH Confirm]   [4-5]: legacy_version = 0x%04x\n", uint16(hs.serverHello.original[4])<<8|uint16(hs.serverHello.original[5]))
-			fmt.Printf("[DEBUG ECH Confirm]   [6-37]: random (32 bytes)\n")
-			fmt.Printf("[DEBUG ECH Confirm]     random from original[6:38]: %x\n", hs.serverHello.original[6:38])
-			fmt.Printf("[DEBUG ECH Confirm]     random from serverHello.random: %x\n", hs.serverHello.random)
-			fmt.Printf("[DEBUG ECH Confirm]     match? %v\n", bytes.Equal(hs.serverHello.original[6:38], hs.serverHello.random))
-			fmt.Printf("[DEBUG ECH Confirm]   [38]: session_id_len = %d\n", hs.serverHello.original[38])
-
-			// ECH confirmation signal location
-			fmt.Printf("[DEBUG ECH Confirm] ECH confirmation signal location:\n")
-			fmt.Printf("[DEBUG ECH Confirm]   random[24:32] = original[30:38] = %x\n", hs.serverHello.original[30:38])
-			fmt.Printf("[DEBUG ECH Confirm]   This is the SERVER's confirmation value\n")
-
-			// ===== SECTION 4: MODIFIED SERVER HELLO FOR TRANSCRIPT =====
-			fmt.Printf("\n[DEBUG ECH Confirm] ===== SECTION 4: MODIFIED SERVER HELLO =====\n")
-			fmt.Printf("[DEBUG ECH Confirm] For ECH confirmation, we zero bytes [30:38] of ServerHello\n")
-			fmt.Printf("[DEBUG ECH Confirm] Before zeroing [30:38]: %x\n", hs.serverHello.original[30:38])
-
-			// Build modified ServerHello explicitly for debugging
-			modifiedSH := make([]byte, len(hs.serverHello.original))
-			copy(modifiedSH, hs.serverHello.original)
-			copy(modifiedSH[30:38], make([]byte, 8))
-			fmt.Printf("[DEBUG ECH Confirm] After zeroing [30:38]: %x\n", modifiedSH[30:38])
-			fmt.Printf("[DEBUG ECH Confirm] Modified ServerHello (first 50 bytes): %x\n", modifiedSH[:min(50, len(modifiedSH))])
-
-			// ===== SECTION 5: ECH CONFIRMATION CALCULATION =====
-			fmt.Printf("\n[DEBUG ECH Confirm] ===== SECTION 5: ECH CONFIRMATION CALCULATION =====\n")
-
-			// Clone transcript and add modified ServerHello
+			// Standard ECH confirmation check
+			// Clone transcript and add modified ServerHello (with confirmation bytes zeroed)
 			confTranscript := cloneHash(hs.echContext.innerTranscript, hs.suite.hash)
 			confTranscript.Write(hs.serverHello.original[:30])
 			confTranscript.Write(make([]byte, 8))
 			confTranscript.Write(hs.serverHello.original[38:])
 
 			transcriptHash := confTranscript.Sum(nil)
-			fmt.Printf("[DEBUG ECH Confirm] transcript_ech_conf (CH_inner + modified SH):\n")
-			fmt.Printf("[DEBUG ECH Confirm]   hash: %x\n", transcriptHash)
 
-			// HKDF-Extract
-			fmt.Printf("[DEBUG ECH Confirm] HKDF-Extract inputs:\n")
-			fmt.Printf("[DEBUG ECH Confirm]   IKM (innerHello.random): %x\n", hs.echContext.innerHello.random)
-			fmt.Printf("[DEBUG ECH Confirm]   salt: nil (= %d zero bytes for %s)\n", hs.suite.hash.Size(), hs.suite.hash.String())
-
+			// HKDF-Extract with innerHello.random as IKM
 			prfSecret := hkdf.Extract(hs.suite.hash.New, hs.echContext.innerHello.random, nil)
-			fmt.Printf("[DEBUG ECH Confirm]   PRF secret: %x\n", prfSecret)
 
-			// ExpandLabel
-			fmt.Printf("[DEBUG ECH Confirm] HKDF-Expand-Label inputs:\n")
-			fmt.Printf("[DEBUG ECH Confirm]   secret: %x\n", prfSecret)
-			fmt.Printf("[DEBUG ECH Confirm]   label: \"ech accept confirmation\"\n")
-			fmt.Printf("[DEBUG ECH Confirm]   context (transcript_hash): %x\n", transcriptHash)
-			fmt.Printf("[DEBUG ECH Confirm]   length: 8\n")
-
+			// Compute ECH accept confirmation
 			acceptConfirmation := tls13.ExpandLabel(hs.suite.hash.New,
 				prfSecret,
 				"ech accept confirmation",
@@ -211,43 +126,7 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 			)
 
 			serverConfirmation := hs.serverHello.random[len(hs.serverHello.random)-8:]
-
-			// ===== SECTION 6: FINAL COMPARISON =====
-			fmt.Printf("\n[DEBUG ECH Confirm] ===== SECTION 6: FINAL COMPARISON =====\n")
-			fmt.Printf("[DEBUG ECH Confirm] Our computed confirmation:    %x\n", acceptConfirmation)
-			fmt.Printf("[DEBUG ECH Confirm] Server's confirmation:        %x\n", serverConfirmation)
 			match := subtle.ConstantTimeCompare(acceptConfirmation, serverConfirmation) == 1
-			fmt.Printf("[DEBUG ECH Confirm] MATCH: %v\n", match)
-
-			if !match {
-				fmt.Printf("\n[DEBUG ECH Confirm] ===== MISMATCH ANALYSIS =====\n")
-				fmt.Printf("[DEBUG ECH Confirm] Possible causes:\n")
-				fmt.Printf("[DEBUG ECH Confirm]   1. Wrong random used (inner vs outer)\n")
-				fmt.Printf("[DEBUG ECH Confirm]   2. Wrong transcript (different CH_inner)\n")
-				fmt.Printf("[DEBUG ECH Confirm]   3. Wrong ServerHello zeroing position\n")
-				fmt.Printf("[DEBUG ECH Confirm]   4. Server using different confirmation calculation\n")
-
-				// Additional debug: dump what's in innerTranscript
-				fmt.Printf("\n[DEBUG ECH Confirm] Additional debug info:\n")
-				fmt.Printf("[DEBUG ECH Confirm]   hs.echContext.encodedInnerHello len: %d\n", len(hs.echContext.encodedInnerHello))
-				fmt.Printf("[DEBUG ECH Confirm]   hs.echContext.expandedInnerHello len: %d\n", len(hs.echContext.expandedInnerHello))
-				if len(hs.echContext.expandedInnerHello) > 0 {
-					fmt.Printf("[DEBUG ECH Confirm]   expandedInnerHello first 64: %x\n", hs.echContext.expandedInnerHello[:min(64, len(hs.echContext.expandedInnerHello))])
-					fmt.Printf("[DEBUG ECH Confirm]   expandedInnerHello last 64: %x\n", hs.echContext.expandedInnerHello[max(0, len(hs.echContext.expandedInnerHello)-64):])
-				}
-
-				// Check PSK info
-				fmt.Printf("[DEBUG ECH Confirm]   innerHello.pskIdentities len: %d\n", len(hs.echContext.innerHello.pskIdentities))
-				fmt.Printf("[DEBUG ECH Confirm]   innerHello.pskBinders len: %d\n", len(hs.echContext.innerHello.pskBinders))
-				if len(hs.echContext.innerHello.pskBinders) > 0 {
-					fmt.Printf("[DEBUG ECH Confirm]   innerHello.pskBinders[0]: %x\n", hs.echContext.innerHello.pskBinders[0])
-				}
-
-				// Check cipher suite
-				fmt.Printf("[DEBUG ECH Confirm]   cipher suite: %s (hash size: %d)\n", hs.suite.hash.String(), hs.suite.hash.Size())
-			}
-
-			fmt.Printf("[DEBUG ECH Confirm] ================================================================================\n\n")
 
 			if match {
 				hs.hello = hs.echContext.innerHello
@@ -266,9 +145,8 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 				}
 			} else {
 				hs.echContext.echRejected = true
-				fmt.Printf("[DEBUG ECH Confirm] ECH REJECTED - falling back to outer hello\n")
 			}
-		} // end of standard ECH confirmation check (else branch of pskInOuterOnly)
+		}
 	}
 
 	if err := transcriptMsg(hs.serverHello, hs.transcript); err != nil {
@@ -314,7 +192,6 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 		// In this case, server uses outer hello's PSK directly for session resumption,
 		// bypassing ECH. This is normal and should not cause an error.
 		if hs.echContext.pskInOuterOnly {
-			fmt.Printf("[DEBUG ECH] ECH rejected but pskInOuterOnly=true, continuing (Chrome-style PSK)\n")
 			// Don't send alert, don't return error - just continue
 		} else {
 			c.sendAlert(alertECHRequired)
@@ -1182,10 +1059,7 @@ func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {
 		return errors.New("tls: received new session ticket from a client")
 	}
 
-	fmt.Printf("[DEBUG utls] handleNewSessionTicket: ticketsDisabled=%v, cacheNil=%v, quicNil=%v\n",
-		c.config.SessionTicketsDisabled, c.config.ClientSessionCache == nil, c.quic == nil)
 	if c.config.SessionTicketsDisabled || c.config.ClientSessionCache == nil {
-		fmt.Printf("[DEBUG utls] handleNewSessionTicket: returning early (disabled or no cache)\n")
 		return nil
 	}
 
@@ -1219,9 +1093,7 @@ func (c *Conn) handleNewSessionTicket(msg *newSessionTicketMsgTLS13) error {
 	session.ageAdd = msg.ageAdd
 	session.EarlyData = c.quic != nil && msg.maxEarlyData == 0xffffffff // RFC 9001, Section 4.6.1
 	session.ticket = msg.label
-	fmt.Printf("[DEBUG utls] handleNewSessionTicket: quic=%v, enableSessionEvents=%v\n", c.quic != nil, c.quic != nil && c.quic.enableSessionEvents)
 	if c.quic != nil && c.quic.enableSessionEvents {
-		fmt.Printf("[DEBUG utls] handleNewSessionTicket: calling quicStoreSession\n")
 		c.quicStoreSession(session)
 		return nil
 	}

@@ -83,31 +83,22 @@ const shouldLoad shouldLoadSessionResult = 3
 //   - If both the `sessionTicketExt` and `pskExtension` are nil, which might occur if the client hello spec does not include them, we should skip the loadSession().
 //   - In all other cases, the function proceeds to load the session.
 func (s *sessionController) shouldLoadSession() shouldLoadSessionResult {
-	// Debug logging for session resumption troubleshooting
-	fmt.Printf("[DEBUG utls] shouldLoadSession: sessionTicketExt=%v, pskExtension=%v, buildStatus=%d, loadTracker=%d, state=%d\n",
-		s.sessionTicketExt != nil, s.pskExtension != nil, s.uconnRef.clientHelloBuildStatus, s.loadSessionTracker, s.state)
-
 	// Check if we have session-related extensions
 	if s.sessionTicketExt == nil && s.pskExtension == nil {
-		fmt.Printf("[DEBUG utls] shouldLoadSession: returning shouldReturn (no session extensions)\n")
 		return shouldReturn
 	}
 	// Only skip if session was already loaded (not based on build status)
 	// This fixes a bug where ApplyPreset() sets clientHelloBuildStatus before buildHandshakeState runs,
 	// causing session loading to be incorrectly skipped
 	if s.loadSessionTracker == CalledByULoadSession || s.loadSessionTracker == CalledByGoTLS {
-		fmt.Printf("[DEBUG utls] shouldLoadSession: returning shouldReturn (already loaded)\n")
 		return shouldReturn
 	}
 	if s.state == SessionTicketExtInitialized {
-		fmt.Printf("[DEBUG utls] shouldLoadSession: returning shouldSetTicket\n")
 		return shouldSetTicket
 	}
 	if s.state == PskExtInitialized {
-		fmt.Printf("[DEBUG utls] shouldLoadSession: returning shouldSetPsk\n")
 		return shouldSetPsk
 	}
-	fmt.Printf("[DEBUG utls] shouldLoadSession: returning shouldLoad\n")
 	return shouldLoad
 }
 

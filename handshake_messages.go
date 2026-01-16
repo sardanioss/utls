@@ -7,7 +7,6 @@ package tls
 import (
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 
@@ -113,9 +112,6 @@ func (m *clientHelloMsg) marshalMsg(echInner bool) ([]byte, error) {
 
 func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []uint16) ([]byte, error) {
 	// [uTLS SECTION END]
-	if os.Getenv("UTLS_ECH_DEBUG") != "" && echInner && outerExts != nil {
-		fmt.Printf("[ECH DEBUG] marshalMsgReorderOuterExts called with outerExts: %v\n", outerExts)
-	}
 	var exts cryptobyte.Builder
 	var echOuterExts []uint16
 
@@ -200,10 +196,6 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 				echOuterExts = append(echOuterExts, extensionEarlyData)
 			// Note: server_name, encrypted_client_hello, and pre_shared_key are NOT compressed
 			}
-		}
-
-		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("[ECH DEBUG] Built echOuterExts: %v\n", echOuterExts)
 		}
 
 		// Add ech_outer_extensions - ALWAYS third
@@ -693,35 +685,6 @@ func (m *clientHelloMsg) marshalExpandedECHWithoutBinders(outerExts []uint16, ou
 	// Strip binders from the end, but keep all length fields as-is
 	truncatedMessage := fullMessage[:len(fullMessage)-bindersLen]
 
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG] Truncated message for binder:\n")
-		fmt.Printf("  Full len: %d, Stripped binders: %d, Truncated len: %d\n",
-			len(fullMessage), bindersLen, len(truncatedMessage))
-		// Show the header length (should still reflect full message)
-		headerLen := int(truncatedMessage[1])<<16 | int(truncatedMessage[2])<<8 | int(truncatedMessage[3])
-		fmt.Printf("  Header len field: %d (unchanged, per RFC 8446)\n", headerLen)
-		// Parse and show session_id from the truncated message
-		if len(truncatedMessage) > 38 {
-			sessionIdLen := int(truncatedMessage[38])
-			fmt.Printf("  Session_id in truncated msg: len=%d\n", sessionIdLen)
-			if sessionIdLen > 0 && len(truncatedMessage) > 38+1+sessionIdLen {
-				fmt.Printf("  Session_id bytes: %x\n", truncatedMessage[39:39+sessionIdLen])
-			}
-		}
-		// Print first 100 bytes to verify header structure
-		firstBytes := truncatedMessage
-		if len(firstBytes) > 100 {
-			firstBytes = firstBytes[:100]
-		}
-		fmt.Printf("  First %d bytes of truncated msg: %x\n", len(firstBytes), firstBytes)
-		// Print last 50 bytes to verify PSK identities end
-		lastBytes := truncatedMessage
-		if len(lastBytes) > 50 {
-			lastBytes = lastBytes[len(lastBytes)-50:]
-		}
-		fmt.Printf("  Last %d bytes of truncated msg: %x\n", len(lastBytes), lastBytes)
-	}
-
 	return truncatedMessage, nil
 }
 
@@ -733,9 +696,6 @@ func (m *clientHelloMsg) marshalExpandedECHWithoutBinders(outerExts []uint16, ou
 // the server copies this to the expanded inner hello.
 // Using raw bytes ensures byte-identical expansion to what the server computes.
 func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16, outerExtRawBytes map[uint16][]byte, outerSessionId []byte) ([]byte, error) {
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG] marshalExpandedECH called with outerExts: %v\n", outerExts)
-	}
 	var exts cryptobyte.Builder
 
 	// 1. ECH inner marker - ALWAYS first (same as compressed format)
@@ -763,7 +723,6 @@ func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16, outerExtRawBytes
 	// The compressed inner builds echOuterExts by iterating outerExts in order,
 	// so we must iterate in the same order here for the binder to match.
 	// We use the raw bytes from the outer hello to ensure byte-identical expansion.
-	var expandedExtsOrder []uint16 // Debug: track order of emitted extensions
 	for _, extType := range outerExts {
 		// Skip extensions that are NOT in ech_outer_extensions
 		switch extType {
@@ -797,14 +756,6 @@ func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16, outerExtRawBytes
 
 		// Use raw bytes from outer hello if available
 		if rawBytes, ok := outerExtRawBytes[extType]; ok {
-			if os.Getenv("UTLS_ECH_DEBUG") != "" {
-				previewLen := 16
-				if len(rawBytes) < previewLen {
-					previewLen = len(rawBytes)
-				}
-				fmt.Printf("[ECH DEBUG] Using raw bytes for ext %d (0x%04x), len=%d, first %d bytes: %x\n", extType, extType, len(rawBytes), previewLen, rawBytes[:previewLen])
-			}
-			expandedExtsOrder = append(expandedExtsOrder, extType)
 			exts.AddBytes(rawBytes)
 			continue
 		}
@@ -940,21 +891,11 @@ func (m *clientHelloMsg) marshalExpandedECH(outerExts []uint16, outerExtRawBytes
 		}
 	}
 
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG] Expanded inner exts order: %v\n", expandedExtsOrder)
-	}
-
 	// 4. supported_versions and early_data come via ech_outer_extensions (not inline)
 	// Chrome references them from outer hello via ech_outer_extensions
 
 	// 5. pre_shared_key - MUST be last extension (RFC 8446)
 	if len(m.pskIdentities) > 0 {
-		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("[ECH DEBUG] PSK in expanded format: identities=%d, binders=%d\n", len(m.pskIdentities), len(m.pskBinders))
-			for i, id := range m.pskIdentities {
-				fmt.Printf("[ECH DEBUG]   identity[%d]: label_len=%d, ticket_age=0x%08x\n", i, len(id.label), id.obfuscatedTicketAge)
-			}
-		}
 		exts.AddUint16(extensionPreSharedKey)
 		exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
 			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
