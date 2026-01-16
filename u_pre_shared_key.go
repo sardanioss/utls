@@ -144,6 +144,9 @@ type UtlsPreSharedKeyExtension struct {
 	cachedLength *int
 	// Deprecated: Set OmitEmptyPsk in Config instead.
 	OmitEmptyPsk bool
+	// SkipBinderPatching prevents PatchBuiltHello from recalculating binders.
+	// This is used in ECH PROPER mode where outer PSK has GREASE values.
+	SkipBinderPatching bool
 }
 
 func (e *UtlsPreSharedKeyExtension) IsInitialized() bool {
@@ -283,6 +286,10 @@ func (e *UtlsPreSharedKeyExtension) Read(b []byte) (int, error) {
 
 func (e *UtlsPreSharedKeyExtension) PatchBuiltHello(hello *PubClientHelloMsg) error {
 	if e.Len() == 0 {
+		return nil
+	}
+	// Skip binder patching in ECH PROPER mode where outer has GREASE PSK values
+	if e.SkipBinderPatching {
 		return nil
 	}
 	private := hello.getCachedPrivatePtr()

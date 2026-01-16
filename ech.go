@@ -369,6 +369,14 @@ func extractRawExtensions(hello *clientHelloMsg) ([]rawExtension, error) {
 }
 
 func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHelloMsg, error) {
+	inner, _, err := decodeInnerClientHelloWithRaw(outer, encoded)
+	return inner, err
+}
+
+// decodeInnerClientHelloWithRaw is like decodeInnerClientHello but also returns the raw
+// reconstructed bytes. This is needed for PSK binder calculation where we must compute
+// the binder over the exact bytes the server will reconstruct.
+func decodeInnerClientHelloWithRaw(outer *clientHelloMsg, encoded []byte) (*clientHelloMsg, []byte, error) {
 	// Reconstructing the inner client hello from its encoded form is somewhat
 	// complicated. It is missing its header (message type and length), session
 	// ID, and the extensions may be compressed. Since we need to put the
@@ -386,7 +394,7 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 		!readUint16LengthPrefixed(&innerReader, &cipherSuites) ||
 		!readUint8LengthPrefixed(&innerReader, &compressionMethods) ||
 		!innerReader.ReadUint16LengthPrefixed(&extensions) {
-		return nil, errors.New("tls: invalid inner client hello")
+		return nil, nil, errors.New("tls: invalid inner client hello")
 	}
 
 	// The specification says we must verify that the trailing padding is all
@@ -394,13 +402,13 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 	// throw away any trailing garbage.
 	for _, p := range innerReader {
 		if p != 0 {
-			return nil, errors.New("tls: invalid inner client hello")
+			return nil, nil, errors.New("tls: invalid inner client hello")
 		}
 	}
 
 	rawOuterExts, err := extractRawExtensions(outer)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	recon := cryptobyte.NewBuilder(nil)
@@ -467,22 +475,22 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 
 	reconBytes, err := recon.Bytes()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	inner := &clientHelloMsg{}
 	if !inner.unmarshal(reconBytes) {
-		return nil, errors.New("tls: invalid reconstructed inner client hello")
+		return nil, nil, errors.New("tls: invalid reconstructed inner client hello")
 	}
 
 	if !bytes.Equal(inner.encryptedClientHello, []byte{uint8(innerECHExt)}) {
-		return nil, errInvalidECHExt
+		return nil, nil, errInvalidECHExt
 	}
 
 	if len(inner.supportedVersions) != 1 || (len(inner.supportedVersions) >= 1 && inner.supportedVersions[0] != VersionTLS13) {
-		return nil, errors.New("tls: client sent encrypted_client_hello extension and offered incompatible versions")
+		return nil, nil, errors.New("tls: client sent encrypted_client_hello extension and offered incompatible versions")
 	}
 
-	return inner, nil
+	return inner, reconBytes, nil
 }
 
 func decryptECHPayload(context *hpke.Receipient, hello, payload []byte) ([]byte, error) {

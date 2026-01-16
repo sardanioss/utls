@@ -285,6 +285,8 @@ type echClientContext struct {
 	// not encrypted inside ECH. In this case, ECH rejection is expected and should not
 	// cause an error - the server uses outer hello's PSK directly for session resumption.
 	pskInOuterOnly bool
+	// preSealExpandedInner stores the expandedInnerHello from PRE-SEAL decode for debugging
+	preSealExpandedInner []byte
 }
 
 func (c *Conn) clientHandshake(ctx context.Context) (err error) {
@@ -471,6 +473,7 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 		}
 	}
 	if !versOk {
+		fmt.Printf("[DEBUG utls] loadSession: version mismatch! session.version=0x%04x, hello.supportedVersions=%v\n", session.version, hello.supportedVersions)
 		return nil, nil, nil, nil
 	}
 
@@ -481,6 +484,7 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	if !c.config.InsecureSkipTimeVerify {
 		if c.config.time().After(session.peerCertificates[0].NotAfter) {
 			// Expired certificate, delete the entry.
+			fmt.Printf("[DEBUG utls] loadSession: cert expired\n")
 			c.config.ClientSessionCache.Put(cacheKey, nil)
 			return nil, nil, nil, nil
 		}
@@ -489,6 +493,7 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	if !c.config.InsecureSkipVerify {
 		if len(session.verifiedChains) == 0 {
 			// The original connection had InsecureSkipVerify, while this doesn't.
+			fmt.Printf("[DEBUG utls] loadSession: no verified chains\n")
 			return nil, nil, nil, nil
 		}
 		// [UTLS SECTION START]
@@ -500,6 +505,7 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 		}
 		if len(dnsName) > 0 {
 			if err := session.peerCertificates[0].VerifyHostname(dnsName); err != nil {
+				fmt.Printf("[DEBUG utls] loadSession: hostname verify failed: %v\n", err)
 				return nil, nil, nil, nil
 			}
 		}
@@ -510,6 +516,7 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 		// In TLS 1.2 the cipher suite must match the resumed session. Ensure we
 		// are still offering it.
 		if mutualCipherSuite(hello.cipherSuites, session.cipherSuite) == nil {
+			fmt.Printf("[DEBUG utls] loadSession: TLS 1.2 cipher mismatch\n")
 			return nil, nil, nil, nil
 		}
 
@@ -517,8 +524,10 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 		return
 	}
 
+	fmt.Printf("[DEBUG utls] loadSession: TLS 1.3 session, useBy=%d, now=%d\n", session.useBy, c.config.time().Unix())
 	// Check that the session ticket is not expired.
 	if c.config.time().After(time.Unix(int64(session.useBy), 0)) {
+		fmt.Printf("[DEBUG utls] loadSession: session ticket expired\n")
 		c.config.ClientSessionCache.Put(cacheKey, nil)
 		return nil, nil, nil, nil
 	}
@@ -527,6 +536,7 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	// offer at least one cipher suite with that hash.
 	cipherSuite := cipherSuiteTLS13ByID(session.cipherSuite)
 	if cipherSuite == nil {
+		fmt.Printf("[DEBUG utls] loadSession: cipher suite 0x%04x not found\n", session.cipherSuite)
 		return nil, nil, nil, nil
 	}
 	cipherSuiteOk := false
@@ -538,8 +548,10 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 		}
 	}
 	if !cipherSuiteOk {
+		fmt.Printf("[DEBUG utls] loadSession: cipher suite hash mismatch\n")
 		return nil, nil, nil, nil
 	}
+	fmt.Printf("[DEBUG utls] loadSession: cipher suite OK, setting PSK identities\n")
 
 	if c.quic != nil {
 		if c.quic.enableSessionEvents {
@@ -566,6 +578,7 @@ func (c *Conn) loadSession(hello *clientHelloMsg) (
 	}
 	hello.pskIdentities = []pskIdentity{identity}
 	hello.pskBinders = [][]byte{make([]byte, cipherSuite.hash.Size())}
+	fmt.Printf("[DEBUG utls] loadSession: PSK set! hello.pskIdentities=%d, hello=%p\n", len(hello.pskIdentities), hello)
 
 	// Compute the PSK binders. See RFC 8446, Section 4.2.11.2.
 	earlySecret = tls13.NewEarlySecret(cipherSuite.hash.New, session.secret)

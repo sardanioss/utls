@@ -8,9 +8,11 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
@@ -457,6 +459,11 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	// Store PSK data for ECH+PSK PROPER mode (binder recalculation)
+	if session != nil && binderKey != nil {
+		c.pskBinderKey = binderKey
+		c.pskCipherSuite = cipherSuiteTLS13ByID(session.cipherSuite)
+	}
 	// [uTLS] If session is nil but earlyData was set (e.g., by FakeEarlyDataExtension),
 	// we must clear it since 0-RTT requires a valid session
 	if session == nil && hello.earlyData {
@@ -479,10 +486,34 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		}()
 	}
 
-	if ech != nil && c.clientHelloBuildStatus != BuildByUtls {
+	// Check if we need to rebuild ECH:
+	// 1. Non-uTLS builds always rebuild (original condition)
+	// 2. uTLS builds with PSK and PROPER mode need rebuild to put PSK in inner hello
+	needECHRebuild := c.clientHelloBuildStatus != BuildByUtls
+	// Debug: check PSK state after loadSession
+	if ech != nil {
+		properEnv := os.Getenv("UTLS_ECH_PSK_PROPER")
+		fmt.Printf("[DEBUG ECH PSK] After loadSession: hello.pskIdentities=%d, session=%v, hello=%p, PROPER_ENV='%s', PROPER=%v\n",
+			len(hello.pskIdentities), session != nil, hello, properEnv, properEnv != "")
+	}
+	// TEMP: Hardcode PROPER mode for testing (env var not propagating on Windows)
+	useProperMode := true // os.Getenv("UTLS_ECH_PSK_PROPER") != ""
+	// Only force rebuild for PSK PROPER mode if MarshalClientHello didn't already handle it
+	// For BuildByUtls, MarshalClientHello already computes ECH with correct PSK binders
+	if !needECHRebuild && ech != nil && len(hello.pskIdentities) > 0 && useProperMode && c.clientHelloBuildStatus != BuildByUtls {
+		needECHRebuild = true
+		fmt.Printf("[DEBUG ECH] Forcing ECH rebuild for PSK PROPER mode (hello.pskIdentities=%d)\n", len(hello.pskIdentities))
+	}
+	if ech != nil && needECHRebuild {
 		fmt.Printf("[DEBUG ECH] clientHelloBuildStatus=%d (BuildByUtls=%d), rebuilding ECH\n", c.clientHelloBuildStatus, BuildByUtls)
 		// Split hello into inner and outer
 		ech.innerHello = hello.clone()
+
+		// NOTE: PSK binder calculation moved to computeAndUpdateOuterECHExtensionWithOuterExts
+		// The binder must be calculated over the EXPANDED inner hello format (after decoding),
+		// not the full format inner hello. The server decodes the compressed inner hello
+		// to expanded format and verifies the binder over that. So we must calculate the
+		// binder over the same expanded format.
 
 		// Overwrite the server name in the outer hello with the public facing
 		// name.
@@ -499,7 +530,19 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		// evidence that this is actually a problem.
 
 		// Use UConn method to ensure proper ech_outer_extensions handling
-		if err := c.computeAndUpdateOuterECHExtension(ech.innerHello, ech, true); err != nil {
+		// CRITICAL: For PROPER mode, filter PSK from ech_outer_extensions so PSK is fully in inner
+		outerExts := c.extensionsList()
+		if useProperMode && len(ech.innerHello.pskIdentities) > 0 {
+			filtered := make([]uint16, 0, len(outerExts))
+			for _, ext := range outerExts {
+				if ext != 41 { // extensionPreSharedKey = 41
+					filtered = append(filtered, ext)
+				}
+			}
+			outerExts = filtered
+			fmt.Printf("[DEBUG ECH] PROPER mode rebuild: filtered PSK from outerExts\n")
+		}
+		if err := c.computeAndUpdateOuterECHExtensionWithOuterExts(ech.innerHello, ech, true, outerExts, nil); err != nil {
 			return err
 		}
 	} else if ech != nil {
@@ -642,7 +685,11 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	return nil
 }
 
+var echTranscriptCallCount int
+
 func (c *UConn) echTranscriptMsg(outer *clientHelloMsg, echCtx *echClientContext) (err error) {
+	echTranscriptCallCount++
+	fmt.Printf("[ECH DEBUG] echTranscriptMsg CALLED, total count=%d\n", echTranscriptCallCount)
 	// For PSK+ECH, we MUST use the SAME expanded inner ClientHello that was used
 	// for the PSK binder calculation. This is stored in echCtx.expandedInnerHello.
 	//
@@ -654,26 +701,137 @@ func (c *UConn) echTranscriptMsg(outer *clientHelloMsg, echCtx *echClientContext
 	//
 	// Therefore, when expandedInnerHello is available, use it DIRECTLY.
 
-	fmt.Printf("[ECH DEBUG] === echTranscriptMsg ===\n")
+	fmt.Printf("[ECH DEBUG] ================================================================================\n")
+	fmt.Printf("[ECH DEBUG] === echTranscriptMsg - WRITING TO INNER TRANSCRIPT ===\n")
+	fmt.Printf("[ECH DEBUG] ================================================================================\n")
 	fmt.Printf("[ECH DEBUG]   expandedInnerHello len: %d\n", len(echCtx.expandedInnerHello))
+	fmt.Printf("[ECH DEBUG]   encodedInnerHello len: %d\n", len(echCtx.encodedInnerHello))
+	fmt.Printf("[ECH DEBUG]   innerTranscript hash BEFORE write: %x\n", echCtx.innerTranscript.Sum(nil))
 
-	// PSK case: Use expandedInnerHello directly (this is what was used for PSK binder)
-	// The server accepts our binder, proving its expansion matches expandedInnerHello
-	if len(echCtx.expandedInnerHello) > 0 {
-		fmt.Printf("[ECH DEBUG]   PSK case - Using expandedInnerHello directly\n")
-		echCtx.innerTranscript.Write(echCtx.expandedInnerHello)
-		fmt.Printf("[ECH DEBUG]   innerTranscript hash after write=%x\n", echCtx.innerTranscript.Sum(nil)[:16])
+	// Show innerHello info
+	fmt.Printf("[ECH DEBUG]   echCtx.innerHello.random: %x\n", echCtx.innerHello.random)
+	fmt.Printf("[ECH DEBUG]   echCtx.innerHello.pskIdentities len: %d\n", len(echCtx.innerHello.pskIdentities))
+	fmt.Printf("[ECH DEBUG]   echCtx.innerHello.pskBinders len: %d\n", len(echCtx.innerHello.pskBinders))
+	if len(echCtx.innerHello.pskBinders) > 0 {
+		fmt.Printf("[ECH DEBUG]   echCtx.innerHello.pskBinders[0]: %x\n", echCtx.innerHello.pskBinders[0])
+	}
+
+	// Show outer hello info
+	fmt.Printf("[ECH DEBUG]   outer.random: %x\n", outer.random)
+	fmt.Printf("[ECH DEBUG]   outer.sessionId: %x\n", outer.sessionId)
+	fmt.Printf("[ECH DEBUG]   outer.original len: %d\n", len(outer.original))
+
+	// PSK case: We have pre-computed expandedInnerHello, need to re-expand using
+	// the FINAL outer hello to ensure consistency with server's expansion
+	if len(echCtx.expandedInnerHello) > 0 && len(echCtx.encodedInnerHello) > 0 {
+		fmt.Printf("[ECH DEBUG]   *** PSK CASE: Using stored encodedInnerHello ***\n")
+
+		// Show what's in stored expandedInnerHello
+		if len(echCtx.expandedInnerHello) > 37 {
+			storedRandom := echCtx.expandedInnerHello[6:38]
+			fmt.Printf("[ECH DEBUG]   stored expandedInnerHello random: %x\n", storedRandom)
+			fmt.Printf("[ECH DEBUG]   stored random matches innerHello.random? %v\n", bytes.Equal(storedRandom, echCtx.innerHello.random))
+		}
+
+		// Compare stored vs what we'll compute
+		storedHash := sha256.Sum256(echCtx.expandedInnerHello)
+		fmt.Printf("[ECH DEBUG]   stored expandedInnerHello SHA256=%x\n", storedHash[:16])
+
+		// HYPOTHESIS DEBUG: Dump raw extension bytes from outer at TRANSCRIPT time
+		fmt.Printf("[ECH DEBUG TRANSCRIPT] === OUTER HELLO EXTENSIONS AT TRANSCRIPT TIME ===\n")
+		fmt.Printf("[ECH DEBUG TRANSCRIPT] outer.original len=%d\n", len(outer.original))
+		if rawExts, err := extractRawExtensions(outer); err != nil {
+			fmt.Printf("[ECH DEBUG TRANSCRIPT] Error extracting extensions: %v\n", err)
+		} else {
+			for _, ext := range rawExts {
+				previewLen := 16
+				if len(ext.data) < previewLen {
+					previewLen = len(ext.data)
+				}
+				fmt.Printf("[ECH DEBUG TRANSCRIPT] Ext 0x%04x: len=%d, first%d=%x\n",
+					ext.extType, len(ext.data), previewLen, ext.data[:previewLen])
+			}
+		}
+		fmt.Printf("[ECH DEBUG TRANSCRIPT] === END TRANSCRIPT EXTENSIONS ===\n")
+
+		// Re-decode using the final outer hello (same as server does)
+		decodedInner, err := decodeInnerClientHello(outer, echCtx.encodedInnerHello)
+		if err != nil {
+			fmt.Printf("[ECH DEBUG]   ERROR re-decoding: %v\n", err)
+			return err
+		}
+
+		redecodedHash := sha256.Sum256(decodedInner.original)
+		fmt.Printf("[ECH DEBUG]   re-decoded inner len=%d, SHA256=%x\n", len(decodedInner.original), redecodedHash[:16])
+
+		// Check random in re-decoded
+		if len(decodedInner.original) > 37 {
+			redecodedRandom := decodedInner.original[6:38]
+			fmt.Printf("[ECH DEBUG]   re-decoded inner random: %x\n", redecodedRandom)
+			fmt.Printf("[ECH DEBUG]   re-decoded random matches innerHello.random? %v\n", bytes.Equal(redecodedRandom, echCtx.innerHello.random))
+		}
+
+		// Check PSK binders in re-decoded
+		fmt.Printf("[ECH DEBUG]   re-decoded inner pskIdentities len: %d\n", len(decodedInner.pskIdentities))
+		fmt.Printf("[ECH DEBUG]   re-decoded inner pskBinders len: %d\n", len(decodedInner.pskBinders))
+		if len(decodedInner.pskBinders) > 0 {
+			fmt.Printf("[ECH DEBUG]   re-decoded inner pskBinders[0]: %x\n", decodedInner.pskBinders[0])
+			if len(echCtx.innerHello.pskBinders) > 0 {
+				fmt.Printf("[ECH DEBUG]   binders match? %v\n", bytes.Equal(decodedInner.pskBinders[0], echCtx.innerHello.pskBinders[0]))
+			}
+		}
+
+		// Check if stored matches re-decoded
+		if bytes.Equal(echCtx.expandedInnerHello, decodedInner.original) {
+			fmt.Printf("[ECH DEBUG]   MATCH: stored expandedInnerHello == re-decoded inner\n")
+		} else {
+			fmt.Printf("[ECH DEBUG]   !!! MISMATCH: stored expandedInnerHello != re-decoded inner !!!\n")
+			fmt.Printf("[ECH DEBUG]   stored len=%d, redecoded len=%d\n", len(echCtx.expandedInnerHello), len(decodedInner.original))
+			fmt.Printf("[ECH DEBUG]   stored first64=%x\n", echCtx.expandedInnerHello[:min(64, len(echCtx.expandedInnerHello))])
+			fmt.Printf("[ECH DEBUG]   redecoded first64=%x\n", decodedInner.original[:min(64, len(decodedInner.original))])
+			// Find first difference
+			minLen := len(echCtx.expandedInnerHello)
+			if len(decodedInner.original) < minLen {
+				minLen = len(decodedInner.original)
+			}
+			for i := 0; i < minLen; i++ {
+				if echCtx.expandedInnerHello[i] != decodedInner.original[i] {
+					fmt.Printf("[ECH DEBUG]   First diff at byte %d: stored=%02x, redecoded=%02x\n", i, echCtx.expandedInnerHello[i], decodedInner.original[i])
+					// Show context around diff
+					start := max(0, i-8)
+					end := min(len(echCtx.expandedInnerHello), i+8)
+					fmt.Printf("[ECH DEBUG]   stored[%d:%d]=%x\n", start, end, echCtx.expandedInnerHello[start:end])
+					end = min(len(decodedInner.original), i+8)
+					fmt.Printf("[ECH DEBUG]   redecoded[%d:%d]=%x\n", start, end, decodedInner.original[start:end])
+					break
+				}
+			}
+		}
+
+		// IMPORTANT: Show what we're actually writing to transcript
+		fmt.Printf("[ECH DEBUG]   *** WRITING TO TRANSCRIPT: decodedInner.original ***\n")
+		fmt.Printf("[ECH DEBUG]   bytes being written len=%d\n", len(decodedInner.original))
+		fmt.Printf("[ECH DEBUG]   bytes first64=%x\n", decodedInner.original[:min(64, len(decodedInner.original))])
+		fmt.Printf("[ECH DEBUG]   bytes last64=%x\n", decodedInner.original[max(0, len(decodedInner.original)-64):])
+
+		if err := transcriptMsg(decodedInner, echCtx.innerTranscript); err != nil {
+			return err
+		}
+
+		fmt.Printf("[ECH DEBUG]   innerTranscript hash AFTER write: %x\n", echCtx.innerTranscript.Sum(nil))
+		fmt.Printf("[ECH DEBUG] ================================================================================\n")
 		return nil
 	}
 
 	// Non-PSK case: Use encode/decode path
-	fmt.Printf("[ECH DEBUG]   No expandedInnerHello available, using encode/decode path (non-PSK case)\n")
+	fmt.Printf("[ECH DEBUG]   *** NON-PSK CASE: Fresh encode/decode ***\n")
 
 	// Encode the inner hello (compressed format with ech_outer_extensions)
 	encodedInner, err := encodeInnerClientHelloReorderOuterExts(echCtx.innerHello, int(echCtx.config.MaxNameLength), c.extensionsList())
 	if err != nil {
 		return err
 	}
+	fmt.Printf("[ECH DEBUG]   Fresh encodedInner len=%d\n", len(encodedInner))
 
 	// Decode/expand the inner hello using outer hello
 	decodedInner, err := decodeInnerClientHello(outer, encodedInner)
@@ -681,9 +839,25 @@ func (c *UConn) echTranscriptMsg(outer *clientHelloMsg, echCtx *echClientContext
 		return err
 	}
 
+	// Check random in decoded
+	if len(decodedInner.original) > 37 {
+		decodedRandom := decodedInner.original[6:38]
+		fmt.Printf("[ECH DEBUG]   decoded inner random: %x\n", decodedRandom)
+		fmt.Printf("[ECH DEBUG]   decoded random matches innerHello.random? %v\n", bytes.Equal(decodedRandom, echCtx.innerHello.random))
+	}
+
+	// Dump what we're writing to transcript (non-PSK case)
+	innerBytes := decodedInner.original
+	fmt.Printf("[ECH DEBUG]   *** WRITING TO TRANSCRIPT: decodedInner.original ***\n")
+	fmt.Printf("[ECH DEBUG]   bytes being written len=%d\n", len(innerBytes))
+	fmt.Printf("[ECH DEBUG]   bytes first64=%x\n", innerBytes[:min(64, len(innerBytes))])
+	fmt.Printf("[ECH DEBUG]   bytes last64=%x\n", innerBytes[max(0, len(innerBytes)-64):])
+
 	if err := transcriptMsg(decodedInner, echCtx.innerTranscript); err != nil {
 		return err
 	}
 
+	fmt.Printf("[ECH DEBUG]   innerTranscript hash AFTER write: %x\n", echCtx.innerTranscript.Sum(nil))
+	fmt.Printf("[ECH DEBUG] ================================================================================\n")
 	return nil
 }

@@ -218,8 +218,24 @@ func (m *clientHelloMsg) marshalMsgReorderOuterExts(echInner bool, outerExts []u
 			})
 		}
 
-		// 4. supported_versions and early_data come via ech_outer_extensions (not inline)
-		// Chrome references them from outer hello via ech_outer_extensions
+		// 4. supported_versions - if not in ech_outer_extensions, add inline with TLS 1.3 only
+		// ECH inner MUST only support TLS 1.3 per spec
+		supportedVersionsInOuter := false
+		for _, e := range echOuterExts {
+			if e == extensionSupportedVersions {
+				supportedVersionsInOuter = true
+				break
+			}
+		}
+		if !supportedVersionsInOuter && len(m.supportedVersions) > 0 {
+			// Add supported_versions with only TLS 1.3
+			exts.AddUint16(extensionSupportedVersions)
+			exts.AddUint16LengthPrefixed(func(exts *cryptobyte.Builder) {
+				exts.AddUint8LengthPrefixed(func(exts *cryptobyte.Builder) {
+					exts.AddUint16(VersionTLS13)
+				})
+			})
+		}
 
 		// 5. Add pre_shared_key if present - MUST be last extension (RFC 8446)
 		// For ECH, PSK must be in the inner ClientHello with binders calculated over inner hello
