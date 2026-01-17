@@ -821,6 +821,7 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				&ApplicationSettingsExtension{SupportedProtocols: []string{"h2"}},
 				BoringGREASEECH(),
 				&UtlsGREASEExtension{},
+				&UtlsPreSharedKeyExtension{}, // PSK must be last extension for TLS 1.3 session resumption
 			}),
 		}, nil
 	case HelloChrome_131:

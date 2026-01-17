@@ -83,8 +83,14 @@ const shouldLoad shouldLoadSessionResult = 3
 //   - If both the `sessionTicketExt` and `pskExtension` are nil, which might occur if the client hello spec does not include them, we should skip the loadSession().
 //   - In all other cases, the function proceeds to load the session.
 func (s *sessionController) shouldLoadSession() shouldLoadSessionResult {
-	if s.sessionTicketExt == nil && s.pskExtension == nil || s.uconnRef.clientHelloBuildStatus != NotBuilt {
-		// No need to load session since we don't have the related extensions.
+	// Check if we have session-related extensions
+	if s.sessionTicketExt == nil && s.pskExtension == nil {
+		return shouldReturn
+	}
+	// Only skip if session was already loaded (not based on build status)
+	// This fixes a bug where ApplyPreset() sets clientHelloBuildStatus before buildHandshakeState runs,
+	// causing session loading to be incorrectly skipped
+	if s.loadSessionTracker == CalledByULoadSession || s.loadSessionTracker == CalledByGoTLS {
 		return shouldReturn
 	}
 	if s.state == SessionTicketExtInitialized {

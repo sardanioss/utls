@@ -273,6 +273,20 @@ type echClientContext struct {
 	aeadID          uint16
 	echRejected     bool
 	retryConfigs    []byte
+	// expandedInnerHello contains the EXPANDED inner ClientHello bytes (with PSK binders)
+	// for early traffic secret calculation. This is computed during ECH setup using
+	// the exact same outerExtRawBytes as the PSK binder calculation.
+	expandedInnerHello []byte
+	// encodedInnerHello contains the ENCODED (compressed) inner ClientHello bytes
+	// that were actually sent to the server. This is used in echTranscriptMsg to
+	// ensure we decode the exact same bytes the server received.
+	encodedInnerHello []byte
+	// pskInOuterOnly indicates Chrome-style PSK handling: real PSK is in outer hello only,
+	// not encrypted inside ECH. In this case, ECH rejection is expected and should not
+	// cause an error - the server uses outer hello's PSK directly for session resumption.
+	pskInOuterOnly bool
+	// preSealExpandedInner stores the expandedInnerHello from PRE-SEAL decode for debugging
+	preSealExpandedInner []byte
 }
 
 func (c *Conn) clientHandshake(ctx context.Context) (err error) {

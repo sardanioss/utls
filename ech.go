@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 
@@ -217,40 +216,11 @@ func encodeInnerClientHello(inner *clientHelloMsg, maxNameLength int) ([]byte, e
 
 // func encodeInnerClientHello(inner *clientHelloMsg, maxNameLength int) ([]byte, error) {
 func encodeInnerClientHelloReorderOuterExts(inner *clientHelloMsg, maxNameLength int, outerExts []uint16) ([]byte, error) { // uTLS
-	// Debug: print inner hello info
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG] Inner hello before marshal:\n")
-		fmt.Printf("  serverName: %s\n", inner.serverName)
-		fmt.Printf("  sessionId len: %d\n", len(inner.sessionId))
-		fmt.Printf("  encryptedClientHello: %v\n", inner.encryptedClientHello)
-		fmt.Printf("  keyShares len: %d\n", len(inner.keyShares))
-		for i, ks := range inner.keyShares {
-			fmt.Printf("    keyShare[%d]: group=%d, data_len=%d\n", i, ks.group, len(ks.data))
-		}
-		fmt.Printf("  pskModes len: %d\n", len(inner.pskModes))
-		fmt.Printf("  pskIdentities len: %d\n", len(inner.pskIdentities))
-		fmt.Printf("  pskBinders len: %d\n", len(inner.pskBinders))
-		fmt.Printf("  supportedCurves len: %d\n", len(inner.supportedCurves))
-		fmt.Printf("  supportedVersions len: %d\n", len(inner.supportedVersions))
-		fmt.Printf("  alpnProtocols: %v\n", inner.alpnProtocols)
-		fmt.Printf("  outerExts: %v\n", outerExts)
-	}
-
 	h, err := inner.marshalMsgReorderOuterExts(true, outerExts)
 	if err != nil {
 		return nil, err
 	}
 	h = h[4:] // strip four byte prefix
-
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG] Inner hello after marshal (len=%d):\n", len(h))
-		// Print all bytes in hex
-		fmt.Printf("  full bytes: %x\n", h)
-
-		// Also parse and show the ech_outer_extensions
-		fmt.Printf("[ECH DEBUG] Parsing inner hello extensions...\n")
-		parseInnerHelloExtensions(h)
-	}
 
 	var paddingLen int
 	if inner.serverName != "" {
@@ -261,64 +231,6 @@ func encodeInnerClientHelloReorderOuterExts(inner *clientHelloMsg, maxNameLength
 	paddingLen = 31 - ((len(h) + paddingLen - 1) % 32)
 
 	return append(h, make([]byte, paddingLen)...), nil
-}
-
-// parseInnerHelloExtensions parses and prints the extensions from an inner hello (for debugging)
-func parseInnerHelloExtensions(h []byte) {
-	// Skip: version(2) + random(32) + sessionID_len(1) + sessionID(var)
-	if len(h) < 35 {
-		fmt.Println("  Inner hello too short")
-		return
-	}
-	offset := 34 // version(2) + random(32)
-	sessionIDLen := int(h[offset])
-	offset += 1 + sessionIDLen
-
-	// Skip cipher suites
-	if offset+2 > len(h) {
-		fmt.Println("  Inner hello too short for cipher suites")
-		return
-	}
-	cipherSuitesLen := int(h[offset])<<8 | int(h[offset+1])
-	offset += 2 + cipherSuitesLen
-
-	// Skip compression methods
-	if offset+1 > len(h) {
-		fmt.Println("  Inner hello too short for compression")
-		return
-	}
-	compressionLen := int(h[offset])
-	offset += 1 + compressionLen
-
-	// Extensions
-	if offset+2 > len(h) {
-		fmt.Println("  No extensions in inner hello")
-		return
-	}
-	extensionsLen := int(h[offset])<<8 | int(h[offset+1])
-	offset += 2
-	fmt.Printf("  Extensions length: %d\n", extensionsLen)
-
-	endOffset := offset + extensionsLen
-	extNum := 0
-	for offset+4 <= len(h) && offset < endOffset {
-		extType := int(h[offset])<<8 | int(h[offset+1])
-		extLen := int(h[offset+2])<<8 | int(h[offset+3])
-		extNum++
-		fmt.Printf("  Ext %d: type=%d (0x%04x), len=%d\n", extNum, extType, extType, extLen)
-
-		if extType == 0xfd00 { // ech_outer_extensions
-			if offset+4+extLen <= len(h) && extLen > 0 {
-				listLen := int(h[offset+4])
-				fmt.Printf("    ech_outer_extensions list_len=%d, contains:\n", listLen)
-				for i := 0; i < listLen/2; i++ {
-					refExt := int(h[offset+5+i*2])<<8 | int(h[offset+5+i*2+1])
-					fmt.Printf("      - %d (0x%04x)\n", refExt, refExt)
-				}
-			}
-		}
-		offset += 4 + extLen
-	}
 }
 
 func skipUint8LengthPrefixed(s *cryptobyte.String) bool {
@@ -369,6 +281,14 @@ func extractRawExtensions(hello *clientHelloMsg) ([]rawExtension, error) {
 }
 
 func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHelloMsg, error) {
+	inner, _, err := decodeInnerClientHelloWithRaw(outer, encoded)
+	return inner, err
+}
+
+// decodeInnerClientHelloWithRaw is like decodeInnerClientHello but also returns the raw
+// reconstructed bytes. This is needed for PSK binder calculation where we must compute
+// the binder over the exact bytes the server will reconstruct.
+func decodeInnerClientHelloWithRaw(outer *clientHelloMsg, encoded []byte) (*clientHelloMsg, []byte, error) {
 	// Reconstructing the inner client hello from its encoded form is somewhat
 	// complicated. It is missing its header (message type and length), session
 	// ID, and the extensions may be compressed. Since we need to put the
@@ -386,7 +306,7 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 		!readUint16LengthPrefixed(&innerReader, &cipherSuites) ||
 		!readUint8LengthPrefixed(&innerReader, &compressionMethods) ||
 		!innerReader.ReadUint16LengthPrefixed(&extensions) {
-		return nil, errors.New("tls: invalid inner client hello")
+		return nil, nil, errors.New("tls: invalid inner client hello")
 	}
 
 	// The specification says we must verify that the trailing padding is all
@@ -394,13 +314,13 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 	// throw away any trailing garbage.
 	for _, p := range innerReader {
 		if p != 0 {
-			return nil, errors.New("tls: invalid inner client hello")
+			return nil, nil, errors.New("tls: invalid inner client hello")
 		}
 	}
 
 	rawOuterExts, err := extractRawExtensions(outer)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	recon := cryptobyte.NewBuilder(nil)
@@ -467,22 +387,22 @@ func decodeInnerClientHello(outer *clientHelloMsg, encoded []byte) (*clientHello
 
 	reconBytes, err := recon.Bytes()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	inner := &clientHelloMsg{}
 	if !inner.unmarshal(reconBytes) {
-		return nil, errors.New("tls: invalid reconstructed inner client hello")
+		return nil, nil, errors.New("tls: invalid reconstructed inner client hello")
 	}
 
 	if !bytes.Equal(inner.encryptedClientHello, []byte{uint8(innerECHExt)}) {
-		return nil, errInvalidECHExt
+		return nil, nil, errInvalidECHExt
 	}
 
 	if len(inner.supportedVersions) != 1 || (len(inner.supportedVersions) >= 1 && inner.supportedVersions[0] != VersionTLS13) {
-		return nil, errors.New("tls: client sent encrypted_client_hello extension and offered incompatible versions")
+		return nil, nil, errors.New("tls: client sent encrypted_client_hello extension and offered incompatible versions")
 	}
 
-	return inner, nil
+	return inner, reconBytes, nil
 }
 
 func decryptECHPayload(context *hpke.Receipient, hello, payload []byte) ([]byte, error) {
@@ -587,6 +507,53 @@ func extractExtensionTypes(hello []byte) []uint16 {
 	}
 	return exts
 }
+// extractExtensionBytesFromHello parses a ClientHello and returns a map of extension type to full extension bytes
+// (including type, length, and data)
+func extractExtensionBytesFromHello(hello []byte) map[uint16][]byte {
+	result := make(map[uint16][]byte)
+	if len(hello) < 38 {
+		return result
+	}
+	offset := 34 // version(2) + random(32)
+
+	// Skip session ID
+	sessionIDLen := int(hello[offset])
+	offset += 1 + sessionIDLen
+	if offset+2 > len(hello) {
+		return result
+	}
+
+	// Skip cipher suites
+	cipherLen := int(hello[offset])<<8 | int(hello[offset+1])
+	offset += 2 + cipherLen
+	if offset+1 > len(hello) {
+		return result
+	}
+
+	// Skip compression methods
+	compLen := int(hello[offset])
+	offset += 1 + compLen
+	if offset+2 > len(hello) {
+		return result
+	}
+
+	// Parse extensions
+	extLen := int(hello[offset])<<8 | int(hello[offset+1])
+	offset += 2
+	endOffset := offset + extLen
+
+	for offset+4 <= len(hello) && offset < endOffset {
+		extType := uint16(hello[offset])<<8 | uint16(hello[offset+1])
+		extDataLen := int(hello[offset+2])<<8 | int(hello[offset+3])
+		fullExtLen := 4 + extDataLen
+		if offset+fullExtLen <= len(hello) {
+			result[extType] = hello[offset : offset+fullExtLen]
+		}
+		offset += fullExtLen
+	}
+	return result
+}
+
 // [uTLS SECTION END]
 
 // validDNSName is a rather rudimentary check for the validity of a DNS name.

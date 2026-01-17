@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
@@ -458,6 +457,11 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	// Store PSK data for ECH+PSK PROPER mode (binder recalculation)
+	if session != nil && binderKey != nil {
+		c.pskBinderKey = binderKey
+		c.pskCipherSuite = cipherSuiteTLS13ByID(session.cipherSuite)
+	}
 	// [uTLS] If session is nil but earlyData was set (e.g., by FakeEarlyDataExtension),
 	// we must clear it since 0-RTT requires a valid session
 	if session == nil && hello.earlyData {
@@ -479,9 +483,25 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		}()
 	}
 
-	if ech != nil && c.clientHelloBuildStatus != BuildByUtls {
+	// Check if we need to rebuild ECH:
+	// 1. Non-uTLS builds always rebuild (original condition)
+	// 2. uTLS builds with PSK and PROPER mode need rebuild to put PSK in inner hello
+	needECHRebuild := c.clientHelloBuildStatus != BuildByUtls
+	useProperMode := true
+	// Only force rebuild for PSK PROPER mode if MarshalClientHello didn't already handle it
+	// For BuildByUtls, MarshalClientHello already computes ECH with correct PSK binders
+	if !needECHRebuild && ech != nil && len(hello.pskIdentities) > 0 && useProperMode && c.clientHelloBuildStatus != BuildByUtls {
+		needECHRebuild = true
+	}
+	if ech != nil && needECHRebuild {
 		// Split hello into inner and outer
 		ech.innerHello = hello.clone()
+
+		// NOTE: PSK binder calculation moved to computeAndUpdateOuterECHExtensionWithOuterExts
+		// The binder must be calculated over the EXPANDED inner hello format (after decoding),
+		// not the full format inner hello. The server decodes the compressed inner hello
+		// to expanded format and verifies the binder over that. So we must calculate the
+		// binder over the same expanded format.
 
 		// Overwrite the server name in the outer hello with the public facing
 		// name.
@@ -498,7 +518,18 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		// evidence that this is actually a problem.
 
 		// Use UConn method to ensure proper ech_outer_extensions handling
-		if err := c.computeAndUpdateOuterECHExtension(ech.innerHello, ech, true); err != nil {
+		// CRITICAL: For PROPER mode, filter PSK from ech_outer_extensions so PSK is fully in inner
+		outerExts := c.extensionsList()
+		if useProperMode && len(ech.innerHello.pskIdentities) > 0 {
+			filtered := make([]uint16, 0, len(outerExts))
+			for _, ext := range outerExts {
+				if ext != 41 { // extensionPreSharedKey = 41
+					filtered = append(filtered, ext)
+				}
+			}
+			outerExts = filtered
+		}
+		if err := c.computeAndUpdateOuterECHExtensionWithOuterExts(ech.innerHello, ech, true, outerExts, nil); err != nil {
 			return err
 		}
 	}
@@ -509,16 +540,48 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 		return err
 	}
 
-	if hello.earlyData {
+	// For ECH, check inner hello's earlyData flag and use EXPANDED inner hello for transcript
+	// CRITICAL: The early traffic secret must be derived from the EXPANDED inner hello format,
+	// not the compressed format. The server uses the expanded format, so we must match it.
+	earlyDataEnabled := hello.earlyData
+	if ech != nil && ech.innerHello != nil {
+		earlyDataEnabled = ech.innerHello.earlyData
+	}
+	if earlyDataEnabled && session != nil {
 		suite := cipherSuiteTLS13ByID(session.cipherSuite)
 		transcript := suite.hash.New()
-		if err := transcriptMsg(hello, transcript); err != nil {
-			return err
+
+		if ech != nil && ech.expandedInnerHello != nil {
+			// Use the pre-computed expanded inner hello (stored during ECH setup)
+			// This ensures we use the EXACT same bytes as the PSK binder calculation
+			transcript.Write(ech.expandedInnerHello)
+		} else if ech != nil && ech.innerHello != nil {
+			// Fallback: compute expanded inner hello (for non-PSK ECH case)
+			encodedInner, err := encodeInnerClientHelloReorderOuterExts(ech.innerHello, int(ech.config.MaxNameLength), c.extensionsList())
+			if err != nil {
+				return err
+			}
+
+			hello.original = c.HandshakeState.Hello.Raw
+
+			decodedInner, err := decodeInnerClientHello(hello, encodedInner)
+			if err != nil {
+				return err
+			}
+
+			if err := transcriptMsg(decodedInner, transcript); err != nil {
+				return err
+			}
+		} else {
+			// Non-ECH case: use hello directly
+			if err := transcriptMsg(hello, transcript); err != nil {
+				return err
+			}
 		}
+
 		earlyTrafficSecret := earlySecret.ClientEarlyTrafficSecret(transcript)
 		c.quicSetWriteSecret(QUICEncryptionLevelEarly, suite.id, earlyTrafficSecret)
 	}
-
 	// serverHelloMsg is not included in the transcript
 	msg, err := c.readHandshake(nil)
 	if err != nil {
@@ -590,27 +653,40 @@ func (c *UConn) clientHandshake(ctx context.Context) (err error) {
 }
 
 func (c *UConn) echTranscriptMsg(outer *clientHelloMsg, echCtx *echClientContext) (err error) {
-	// Recreate the inner ClientHello from its compressed form using server's decodeInnerClientHello function.
-	// See https://github.com/sardanioss/utls/blob/e430876b1d82fdf582efc57f3992d448e7ab3d8a/ech.go#L276-L283
+	// For PSK+ECH, we MUST use the SAME expanded inner ClientHello that was used
+	// for the PSK binder calculation. This is stored in echCtx.expandedInnerHello.
+	//
+	// The server accepts our PSK binder (calculated using marshalExpandedECH output),
+	// which proves the server's expansion matches our expandedInnerHello.
+	// Using decodeInnerClientHello might produce different bytes due to:
+	// 1. Different outer extension bytes in the `outer` parameter
+	// 2. Re-serialization differences
+	//
+	// Therefore, when expandedInnerHello is available, use it DIRECTLY.
 
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG] === echTranscriptMsg ===\n")
-		fmt.Printf("[ECH DEBUG]   extensionsList: %v\n", c.extensionsList())
-		fmt.Printf("[ECH DEBUG]   inner.serverName: %s\n", echCtx.innerHello.serverName)
+	// PSK case: We have pre-computed expandedInnerHello, need to re-expand using
+	// the FINAL outer hello to ensure consistency with server's expansion
+	if len(echCtx.expandedInnerHello) > 0 && len(echCtx.encodedInnerHello) > 0 {
+		// Re-decode using the final outer hello (same as server does)
+		decodedInner, err := decodeInnerClientHello(outer, echCtx.encodedInnerHello)
+		if err != nil {
+			return err
+		}
+
+		if err := transcriptMsg(decodedInner, echCtx.innerTranscript); err != nil {
+			return err
+		}
+		return nil
 	}
 
+	// Non-PSK case: Use encode/decode path
+	// Encode the inner hello (compressed format with ech_outer_extensions)
 	encodedInner, err := encodeInnerClientHelloReorderOuterExts(echCtx.innerHello, int(echCtx.config.MaxNameLength), c.extensionsList())
 	if err != nil {
 		return err
 	}
 
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG]   echTranscriptMsg encodedInner length: %d\n", len(encodedInner))
-		if len(encodedInner) > 32 {
-			fmt.Printf("[ECH DEBUG]   echTranscriptMsg encodedInner (first 32): %x\n", encodedInner[:32])
-		}
-	}
-
+	// Decode/expand the inner hello using outer hello
 	decodedInner, err := decodeInnerClientHello(outer, encodedInner)
 	if err != nil {
 		return err

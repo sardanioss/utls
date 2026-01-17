@@ -25,13 +25,14 @@ type UQUICConn struct {
 //
 // The config's MinVersion must be at least TLS 1.3.
 func UQUICClient(config *QUICConfig, clientHelloID ClientHelloID) *UQUICConn {
-	return newUQUICConn(UClient(nil, config.TLSConfig, clientHelloID))
+	return newUQUICConn(UClient(nil, config.TLSConfig, clientHelloID), config)
 }
 
-func newUQUICConn(uconn *UConn) *UQUICConn {
+func newUQUICConn(uconn *UConn, config *QUICConfig) *UQUICConn {
 	uconn.quic = &quicState{
-		signalc:  make(chan struct{}),
-		blockedc: make(chan struct{}),
+		signalc:             make(chan struct{}),
+		blockedc:            make(chan struct{}),
+		enableSessionEvents: config.EnableSessionEvents, // Enable session events for QUICStoreSession/QUICResumeSession
 	}
 	uconn.quic.events = uconn.quic.eventArr[:0]
 	return &UQUICConn{
@@ -70,6 +71,15 @@ func (q *UQUICConn) NextEvent() QUICEvent {
 		// Write over some of the previous event's data,
 		// to catch callers erroniously retaining it.
 		qs.events[last].Data[0] = 0
+	}
+	// CRITICAL for 0-RTT: If we've processed all events and the handshake is waiting
+	// for us to drain (e.g., after QUICResumeSession), signal it to continue and
+	// wait for it to block again. This ensures we get all events including
+	// QUICSetWriteSecret(Early) before returning QUICNoEvent.
+	if qs.nextEvent >= len(qs.events) && qs.waitingForDrain {
+		qs.waitingForDrain = false
+		<-qs.signalc  // Unblock the handshake
+		<-qs.blockedc // Wait for it to block again (with new events added)
 	}
 	if qs.nextEvent >= len(qs.events) {
 		qs.events = qs.events[:0]

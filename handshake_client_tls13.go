@@ -99,33 +99,53 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 	}
 
 	if hs.echContext != nil {
-		confTranscript := cloneHash(hs.echContext.innerTranscript, hs.suite.hash)
-		confTranscript.Write(hs.serverHello.original[:30])
-		confTranscript.Write(make([]byte, 8))
-		confTranscript.Write(hs.serverHello.original[38:])
-		acceptConfirmation := tls13.ExpandLabel(hs.suite.hash.New,
-			hkdf.Extract(hs.suite.hash.New, hs.echContext.innerHello.random, nil),
-			"ech accept confirmation",
-			confTranscript.Sum(nil),
-			8,
-		)
-		if subtle.ConstantTimeCompare(acceptConfirmation, hs.serverHello.random[len(hs.serverHello.random)-8:]) == 1 {
-			hs.hello = hs.echContext.innerHello
-			c.serverName = c.config.ServerName
-			hs.transcript = hs.echContext.innerTranscript
-			c.echAccepted = true
-
-			if hs.serverHello.encryptedClientHello != nil {
-				c.sendAlert(alertUnsupportedExtension)
-				return errors.New("tls: unexpected encrypted client hello extension in server hello despite ECH being accepted")
-			}
-
-			if hs.hello.serverName == "" && hs.serverHello.serverNameAck {
-				c.sendAlert(alertUnsupportedExtension)
-				return errors.New("tls: unexpected server_name extension in server hello")
-			}
-		} else {
+		// Chrome-style PSK: Skip ECH confirmation check entirely.
+		// Server uses outer hello's PSK directly, ECH is not processed.
+		if hs.echContext.pskInOuterOnly {
 			hs.echContext.echRejected = true
+			// Continue with outer hello context - this is expected behavior
+		} else {
+			// Standard ECH confirmation check
+			// Clone transcript and add modified ServerHello (with confirmation bytes zeroed)
+			confTranscript := cloneHash(hs.echContext.innerTranscript, hs.suite.hash)
+			confTranscript.Write(hs.serverHello.original[:30])
+			confTranscript.Write(make([]byte, 8))
+			confTranscript.Write(hs.serverHello.original[38:])
+
+			transcriptHash := confTranscript.Sum(nil)
+
+			// HKDF-Extract with innerHello.random as IKM
+			prfSecret := hkdf.Extract(hs.suite.hash.New, hs.echContext.innerHello.random, nil)
+
+			// Compute ECH accept confirmation
+			acceptConfirmation := tls13.ExpandLabel(hs.suite.hash.New,
+				prfSecret,
+				"ech accept confirmation",
+				transcriptHash,
+				8,
+			)
+
+			serverConfirmation := hs.serverHello.random[len(hs.serverHello.random)-8:]
+			match := subtle.ConstantTimeCompare(acceptConfirmation, serverConfirmation) == 1
+
+			if match {
+				hs.hello = hs.echContext.innerHello
+				c.serverName = c.config.ServerName
+				hs.transcript = hs.echContext.innerTranscript
+				c.echAccepted = true
+
+				if hs.serverHello.encryptedClientHello != nil {
+					c.sendAlert(alertUnsupportedExtension)
+					return errors.New("tls: unexpected encrypted client hello extension in server hello despite ECH being accepted")
+				}
+
+				if hs.hello.serverName == "" && hs.serverHello.serverNameAck {
+					c.sendAlert(alertUnsupportedExtension)
+					return errors.New("tls: unexpected server_name extension in server hello")
+				}
+			} else {
+				hs.echContext.echRejected = true
+			}
 		}
 	}
 
@@ -168,8 +188,15 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 	}
 
 	if hs.echContext != nil && hs.echContext.echRejected {
-		c.sendAlert(alertECHRequired)
-		return &ECHRejectionError{hs.echContext.retryConfigs}
+		// Chrome-style PSK: ECH rejection is expected when PSK is in outer hello only.
+		// In this case, server uses outer hello's PSK directly for session resumption,
+		// bypassing ECH. This is normal and should not cause an error.
+		if hs.echContext.pskInOuterOnly {
+			// Don't send alert, don't return error - just continue
+		} else {
+			c.sendAlert(alertECHRequired)
+			return &ECHRejectionError{hs.echContext.retryConfigs}
+		}
 	}
 
 	c.isHandshakeComplete.Store(true)

@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/cipher"
-	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -60,6 +59,11 @@ type UConn struct {
 
 	// echCtx is the echContex returned by makeClientHello()
 	echCtx *echClientContext
+
+	// pskBinderKey is stored after loadSession for use in ECH+PSK PROPER mode
+	pskBinderKey []byte
+	// pskCipherSuite is stored after loadSession for use in ECH+PSK PROPER mode
+	pskCipherSuite *cipherSuiteTLS13
 }
 
 // UClient returns a new uTLS client, with behavior depending on clientHelloID.
@@ -150,9 +154,13 @@ func (uconn *UConn) buildHandshakeState(loadSession bool) error {
 			}
 		}
 
-		err = uconn.MarshalClientHello()
-		if err != nil {
-			return err
+		// Only marshal ClientHello if not already built
+		// This prevents overwriting ech.innerHello (with PSK data) on subsequent calls
+		if uconn.clientHelloBuildStatus != BuildByUtls {
+			err = uconn.MarshalClientHello()
+			if err != nil {
+				return err
+			}
 		}
 
 		if loadSession {
@@ -170,8 +178,10 @@ func (uconn *UConn) uLoadSession() error {
 	if cfg := uconn.config; cfg.SessionTicketsDisabled || cfg.ClientSessionCache == nil {
 		return nil
 	}
-	switch uconn.sessionController.shouldLoadSession() {
+	shouldLoad := uconn.sessionController.shouldLoadSession()
+	switch shouldLoad {
 	case shouldReturn:
+		// Nothing to do
 	case shouldSetTicket:
 		uconn.sessionController.setSessionTicketToUConn()
 	case shouldSetPsk:
@@ -189,6 +199,13 @@ func (uconn *UConn) uLoadSession() error {
 			uconn.sessionController.setSessionTicketToUConn()
 		} else {
 			uconn.sessionController.initPskExt(session, earlySecret, binderKey, hello.pskIdentities)
+			// Only propagate PSK if initPskExt succeeded (i.e., pskExtension was present and initialized)
+			if uconn.sessionController.shouldUpdateBinders() {
+				uconn.sessionController.setPskToUConn()
+				// Store for ECH+PSK PROPER mode
+				uconn.pskBinderKey = binderKey
+				uconn.pskCipherSuite = cipherSuiteTLS13ByID(session.cipherSuite)
+			}
 		}
 	}
 
@@ -502,6 +519,11 @@ func (uconn *UConn) extensionsList() []uint16 {
 		ext.Read(buffer)
 		var extension uint16
 		buffer.ReadUint16(&extension)
+		// Exclude supported_versions (43) - inner hello MUST have its own
+		// supported_versions with only TLS 1.3 per ECH spec
+		if extension == extensionSupportedVersions {
+			continue
+		}
 		outerExts = append(outerExts, extension)
 	}
 	return outerExts
@@ -509,26 +531,23 @@ func (uconn *UConn) extensionsList() []uint16 {
 
 func (uconn *UConn) computeAndUpdateOuterECHExtension(inner *clientHelloMsg, ech *echClientContext, useKey bool) error {
 	// Use the current extensions list
-	return uconn.computeAndUpdateOuterECHExtensionWithOuterExts(inner, ech, useKey, uconn.extensionsList())
+	return uconn.computeAndUpdateOuterECHExtensionWithOuterExts(inner, ech, useKey, uconn.extensionsList(), nil)
 }
 
-func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *clientHelloMsg, ech *echClientContext, useKey bool, outerExts []uint16) error {
+func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *clientHelloMsg, ech *echClientContext, useKey bool, outerExts []uint16, pskExt *UtlsPreSharedKeyExtension) error {
 	// This function is mostly copied from
 	// https://github.com/sardanioss/utls/blob/e430876b1d82fdf582efc57f3992d448e7ab3d8a/ech.go#L408
 
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG] === computeAndUpdateOuterECHExtension START ===\n")
-		fmt.Printf("[ECH DEBUG]   useKey: %v\n", useKey)
-		fmt.Printf("[ECH DEBUG]   ech.config.ConfigID: %d\n", ech.config.ConfigID)
-		fmt.Printf("[ECH DEBUG]   ech.kdfID: %d, ech.aeadID: %d\n", ech.kdfID, ech.aeadID)
-		fmt.Printf("[ECH DEBUG]   inner.serverName: %s\n", inner.serverName)
-		fmt.Printf("[ECH DEBUG]   outer SNI in extensions: looking up...\n")
-		for _, ext := range uconn.Extensions {
-			if sniExt, ok := ext.(*SNIExtension); ok {
-				fmt.Printf("[ECH DEBUG]   SNIExtension.ServerName: %s\n", sniExt.ServerName)
-				break
+	// For PSK requests, Chrome includes early_data in ech_outer_extensions
+	// Only filter early_data for non-PSK requests
+	if pskExt == nil {
+		filteredOuterExts := make([]uint16, 0, len(outerExts))
+		for _, extType := range outerExts {
+			if extType != extensionEarlyData {
+				filteredOuterExts = append(filteredOuterExts, extType)
 			}
 		}
+		outerExts = filteredOuterExts
 	}
 
 	var encapKey []byte
@@ -541,12 +560,10 @@ func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *client
 		return err
 	}
 
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG]   encodedInner length: %d bytes\n", len(encodedInner))
-		if len(encodedInner) > 32 {
-			fmt.Printf("[ECH DEBUG]   encodedInner (first 32): %x\n", encodedInner[:32])
-		}
-	}
+	// Store encodedInnerHello for later use
+	// expandedInnerHello will be stored AFTER the outer hello is marshaled, so we can
+	// decode it properly using decodeInnerClientHello to match what the server computes
+	ech.encodedInnerHello = encodedInner
 
 	encryptedLen := len(encodedInner) + 16
 	outerECHExt, err := generateOuterECHExt(ech.config.ConfigID, ech.kdfID, ech.aeadID, encapKey, make([]byte, encryptedLen))
@@ -568,6 +585,9 @@ func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *client
 		Data: outerECHExt,
 	}
 
+	// Chrome keeps early_data in outer hello, and inner references it via ech_outer_extensions
+	// Do NOT remove FakeEarlyDataExtension from outer hello
+
 	if err := uconn.MarshalClientHelloNoECH(); err != nil {
 		return err
 	}
@@ -575,65 +595,87 @@ func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *client
 	serializedOuter := uconn.HandshakeState.Hello.Raw
 	serializedOuter = serializedOuter[4:]
 
-	// Debug: print outer hello SNI
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		// Parse the outer hello to find SNI
-		fmt.Printf("[ECH DEBUG] Outer hello length: %d bytes\n", len(serializedOuter))
-		// Skip: version(2) + random(32) + sessionID(var) + cipherSuites(var) + compression(var)
-		if len(serializedOuter) > 38 {
-			offset := 34 // version(2) + random(32)
-			sessionIdLen := int(serializedOuter[offset])
-			offset += 1 + sessionIdLen
-			cipherSuitesLen := int(serializedOuter[offset])<<8 | int(serializedOuter[offset+1])
-			offset += 2 + cipherSuitesLen
-			compressionLen := int(serializedOuter[offset])
-			offset += 1 + compressionLen
-			if offset+2 < len(serializedOuter) {
-				extensionsLen := int(serializedOuter[offset])<<8 | int(serializedOuter[offset+1])
-				offset += 2
-				fmt.Printf("[ECH DEBUG] Outer extensions length: %d\n", extensionsLen)
-				endOffset := offset + extensionsLen
-				for offset+4 <= len(serializedOuter) && offset < endOffset {
-					extType := int(serializedOuter[offset])<<8 | int(serializedOuter[offset+1])
-					extLen := int(serializedOuter[offset+2])<<8 | int(serializedOuter[offset+3])
-					if extType == 0 { // SNI extension
-						if offset+4+extLen <= len(serializedOuter) {
-							// SNI format: list_len(2) + name_type(1) + name_len(2) + name
-							sniListLen := int(serializedOuter[offset+4])<<8 | int(serializedOuter[offset+5])
-							if sniListLen > 0 && offset+8 < len(serializedOuter) {
-								sniNameLen := int(serializedOuter[offset+7])<<8 | int(serializedOuter[offset+8])
-								if offset+9+sniNameLen <= len(serializedOuter) {
-									sniName := string(serializedOuter[offset+9 : offset+9+sniNameLen])
-									fmt.Printf("[ECH DEBUG] Outer SNI in bytes: %s\n", sniName)
-								}
-							}
+	// NOTE: PSK binder fix moved to the end of this function, after expandedInnerHello is stored.
+	// This ensures we calculate the binder using the FINAL expanded form that matches what
+	// the server will decode.
+
+	// Handle PSK mode: PROPER (default) vs FALLBACK
+	// PROPER mode: PSK in inner hello, ECH maintained during session resumption
+	// FALLBACK mode: PSK in outer only, ECH bypassed (set UTLS_ECH_PSK_FALLBACK=1 to use)
+	useFallbackMode := os.Getenv("UTLS_ECH_PSK_FALLBACK") != ""
+	if pskExt != nil && pskExt.cipherSuite != nil && len(pskExt.BinderKey) > 0 {
+		if useFallbackMode {
+			// FALLBACK mode: PSK in outer only, store outer for early traffic
+			outerWithHeader := make([]byte, 4+len(serializedOuter))
+			outerWithHeader[0] = typeClientHello // 0x01
+			outerWithHeader[1] = byte(len(serializedOuter) >> 16)
+			outerWithHeader[2] = byte(len(serializedOuter) >> 8)
+			outerWithHeader[3] = byte(len(serializedOuter))
+			copy(outerWithHeader[4:], serializedOuter)
+
+			ech.expandedInnerHello = outerWithHeader
+			ech.pskInOuterOnly = true
+		}
+		// PROPER mode (default): pskInOuterOnly stays false
+		// encodedInnerHello and expandedInnerHello are already stored unconditionally above
+	}
+
+	// CRITICAL: Fix PSK binder BEFORE Seal (HPKE sequence number increments per Seal)
+	// The binder must be calculated over the EXPANDED inner hello format, which is what
+	// the server will verify against. We can only call Seal ONCE per HPKE context.
+	if len(inner.pskIdentities) > 0 && uconn.pskCipherSuite != nil && len(uconn.pskBinderKey) > 0 {
+		// Parse outer from serializedOuter to decode inner
+		outerForDecode := new(clientHelloMsg)
+		// Need to add header back for unmarshal
+		outerWithHeader := make([]byte, len(serializedOuter)+4)
+		outerWithHeader[0] = typeClientHello
+		outerWithHeader[1] = byte(len(serializedOuter) >> 16)
+		outerWithHeader[2] = byte(len(serializedOuter) >> 8)
+		outerWithHeader[3] = byte(len(serializedOuter))
+		copy(outerWithHeader[4:], serializedOuter)
+
+		if outerForDecode.unmarshal(outerWithHeader) {
+			// Decode to get expanded form WITH raw bytes
+			decodedInner, reconBytes, decodeErr := decodeInnerClientHelloWithRaw(outerForDecode, encodedInner)
+			if decodeErr == nil && len(decodedInner.pskBinders) > 0 {
+				// Calculate correct binder using raw reconBytes (NOT re-marshaled struct)
+				// Per RFC 8446 Section 4.2.11.2, strip binders from the end but keep length fields intact
+				bindersLen := 2 // uint16 length prefix for binders list
+				for _, binder := range decodedInner.pskBinders {
+					bindersLen += 1 + len(binder) // uint8 length prefix + binder data
+				}
+				helloBytes := reconBytes[:len(reconBytes)-bindersLen]
+
+				transcript := uconn.pskCipherSuite.hash.New()
+				transcript.Write(helloBytes)
+				correctBinder := uconn.pskCipherSuite.finishedHash(uconn.pskBinderKey, transcript)
+
+				// Check if binder matches
+				currentBinder := decodedInner.pskBinders[0]
+				if !bytes.Equal(currentBinder, correctBinder) {
+					// Update inner's binder and re-encode
+					inner.pskBinders[0] = correctBinder
+					inner.original = nil
+					newEncodedInner, encodeErr := encodeInnerClientHelloReorderOuterExts(inner, int(ech.config.MaxNameLength), outerExts)
+					if encodeErr == nil {
+						encodedInner = newEncodedInner
+						ech.encodedInnerHello = encodedInner
+
+						// Re-decode and store raw expandedInnerHello bytes
+						_, fixedReconBytes, decodeErr := decodeInnerClientHelloWithRaw(outerForDecode, encodedInner)
+						if decodeErr == nil && fixedReconBytes != nil {
+							ech.expandedInnerHello = fixedReconBytes
+							ech.preSealExpandedInner = fixedReconBytes // Store for comparison
 						}
 					}
-					offset += 4 + extLen
 				}
 			}
 		}
 	}
 
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG] === HPKE Seal Operation ===\n")
-		fmt.Printf("[ECH DEBUG]   AAD (serializedOuter) length: %d bytes\n", len(serializedOuter))
-		fmt.Printf("[ECH DEBUG]   Plaintext (encodedInner) length: %d bytes\n", len(encodedInner))
-		if len(serializedOuter) > 32 {
-			fmt.Printf("[ECH DEBUG]   AAD (first 32): %x\n", serializedOuter[:32])
-		}
-	}
-
 	encryptedInner, err := ech.hpkeContext.Seal(serializedOuter, encodedInner)
 	if err != nil {
-		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("[ECH DEBUG]   HPKE Seal ERROR: %v\n", err)
-		}
 		return err
-	}
-
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG]   HPKE Seal SUCCESS, ciphertext length: %d bytes\n", len(encryptedInner))
 	}
 
 	outerECHExt, err = generateOuterECHExt(ech.config.ConfigID, ech.kdfID, ech.aeadID, encapKey, encryptedInner)
@@ -645,66 +687,34 @@ func (uconn *UConn) computeAndUpdateOuterECHExtensionWithOuterExts(inner *client
 		Data: outerECHExt,
 	}
 
+	// Chrome keeps early_data in outer hello for PSK, and inner references it via ech_outer_extensions
+	// Do NOT remove FakeEarlyDataExtension from outer hello
+
 	if err := uconn.MarshalClientHelloNoECH(); err != nil {
 		return err
 	}
 
-	if os.Getenv("UTLS_ECH_DEBUG") != "" {
-		fmt.Printf("[ECH DEBUG] === computeAndUpdateOuterECHExtension DONE ===\n")
-		fmt.Printf("[ECH DEBUG]   Final outer hello length: %d bytes\n", len(uconn.HandshakeState.Hello.Raw))
-
-		// Find and print the ECH extension bytes
-		raw := uconn.HandshakeState.Hello.Raw
-		if len(raw) > 4 {
-			offset := 4 + 34 // header + version + random
-			if offset < len(raw) {
-				sessionIdLen := int(raw[offset])
-				offset += 1 + sessionIdLen
-				if offset+2 < len(raw) {
-					cipherSuitesLen := int(raw[offset])<<8 | int(raw[offset+1])
-					offset += 2 + cipherSuitesLen
-					if offset+1 < len(raw) {
-						compressionLen := int(raw[offset])
-						offset += 1 + compressionLen
-						if offset+2 < len(raw) {
-							extLen := int(raw[offset])<<8 | int(raw[offset+1])
-							offset += 2
-							endOffset := offset + extLen
-							for offset+4 <= len(raw) && offset < endOffset {
-								extType := int(raw[offset])<<8 | int(raw[offset+1])
-								extDataLen := int(raw[offset+2])<<8 | int(raw[offset+3])
-								if extType == 0xfe0d { // ECH extension
-									fmt.Printf("[ECH DEBUG]   ECH extension at offset %d, len=%d\n", offset, extDataLen)
-									if offset+4+extDataLen <= len(raw) && extDataLen > 10 {
-										echData := raw[offset+4 : offset+4+extDataLen]
-										fmt.Printf("[ECH DEBUG]   ECH ext: type=%d kdf=%d aead=%d configId=%d encapKeyLen=%d\n",
-											echData[0],
-											int(echData[1])<<8|int(echData[2]),
-											int(echData[3])<<8|int(echData[4]),
-											echData[5],
-											int(echData[6])<<8|int(echData[7]))
-										encapKeyLen := int(echData[6])<<8 | int(echData[7])
-										if 8+encapKeyLen+2 <= len(echData) {
-											payloadLen := int(echData[8+encapKeyLen])<<8 | int(echData[8+encapKeyLen+1])
-											fmt.Printf("[ECH DEBUG]   ECH ext: encapKey (first 8)=%x, payloadLen=%d\n",
-												echData[8:8+8], payloadLen)
-										}
-									}
-									break
-								}
-								offset += 4 + extDataLen
-							}
-						}
-					}
-				}
+	// CRITICAL: Store expandedInnerHello by decoding the encodedInner using the outer hello
+	// This ensures we get the exact same bytes the server will compute when it decodes
+	// First, unmarshal the raw outer hello into a clientHelloMsg
+	outerHello := new(clientHelloMsg)
+	if outerHello.unmarshal(uconn.HandshakeState.Hello.Raw) {
+		decodedInner, decodeErr := decodeInnerClientHello(outerHello, encodedInner)
+		if decodeErr == nil {
+			decodedBytes, marshalErr := decodedInner.marshal()
+			if marshalErr == nil {
+				ech.expandedInnerHello = decodedBytes
 			}
 		}
 	}
 
+	// NOTE: POST-SEAL binder fix is DISABLED because HPKE sequence number increments per Seal.
+	// The binder fix is now done PRE-SEAL (before the Seal call above).
+
 	uconn.Extensions[echExtIdx] = oldExt
 	return nil
-
 }
+
 
 func (uconn *UConn) MarshalClientHello() error {
 	// Ensure ApplyConfig is called to populate HandshakeState.Hello fields from extensions
@@ -714,38 +724,9 @@ func (uconn *UConn) MarshalClientHello() error {
 	}
 
 	if len(uconn.config.EncryptedClientHelloConfigList) > 0 {
-		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("\n[ECH DEBUG] ========== MarshalClientHello START ==========\n")
-			fmt.Printf("[ECH DEBUG] ECHConfigList length: %d bytes\n", len(uconn.config.EncryptedClientHelloConfigList))
-			fmt.Printf("[ECH DEBUG] ServerName: %s\n", uconn.config.ServerName)
-
-			// Check if PSK extension is present
-			for _, ext := range uconn.Extensions {
-				if psk, ok := ext.(*UtlsPreSharedKeyExtension); ok {
-					fmt.Printf("[ECH DEBUG] PSK extension present: identities=%d, binderKey=%d bytes\n",
-						len(psk.Identities), len(psk.BinderKey))
-					break
-				}
-			}
-		}
-
 		inner, _, ech, err := uconn.makeClientHello()
 		if err != nil {
 			return err
-		}
-
-		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("[ECH DEBUG] After makeClientHello:\n")
-			fmt.Printf("[ECH DEBUG]   ech.config.ConfigID: %d\n", ech.config.ConfigID)
-			fmt.Printf("[ECH DEBUG]   ech.config.PublicName: %s\n", string(ech.config.PublicName))
-			fmt.Printf("[ECH DEBUG]   ech.config.KemID: %d\n", ech.config.KemID)
-			fmt.Printf("[ECH DEBUG]   ech.kdfID: %d, ech.aeadID: %d\n", ech.kdfID, ech.aeadID)
-			fmt.Printf("[ECH DEBUG]   ech.encapsulatedKey len: %d\n", len(ech.encapsulatedKey))
-			if len(ech.encapsulatedKey) > 8 {
-				fmt.Printf("[ECH DEBUG]   ech.encapsulatedKey (first 8): %x\n", ech.encapsulatedKey[:8])
-			}
-			fmt.Printf("[ECH DEBUG]   inner.serverName: %s\n", inner.serverName)
-			fmt.Printf("[ECH DEBUG]   inner.random (first 8): %x\n", inner.random[:8])
 		}
 
 		// Copy cipher suites from outer hello (Chrome fingerprint) to inner hello
@@ -766,6 +747,12 @@ func (uconn *UConn) MarshalClientHello() error {
 		inner.ticketSupported = uconn.HandshakeState.Hello.TicketSupported
 		inner.secureRenegotiationSupported = uconn.HandshakeState.Hello.SecureRenegotiationSupported
 		inner.secureRenegotiation = uconn.HandshakeState.Hello.SecureRenegotiation
+
+		// NOTE: ECH spec says early_data "MUST NOT" be in outer hello, but Chrome
+		// includes early_data in outer hello for PSK/0-RTT case and it works.
+		// Without early_data in outer, QUIC 0-RTT fails because server doesn't
+		// know to accept early data. Keeping early_data in both inner and outer.
+		// uconn.HandshakeState.Hello.EarlyData = false // DISABLED - Chrome doesn't do this
 
 		// For PSK with ECH: get PSK data from the extension and recalculate binders for inner hello
 		// The outer hello's binders were calculated over the outer transcript, but the server
@@ -794,140 +781,107 @@ func (uconn *UConn) MarshalClientHello() error {
 			}
 		}
 
-		// For ECH + PSK:
-		// 1. The REAL PSK goes in the inner ClientHello with binders calculated over inner transcript
-		// 2. The outer ClientHello must have a GREASE PSK (random data, same length) per ECH spec
-		// See: draft-ietf-tls-esni Section 6.1.3 - "clients SHOULD send a GREASE pre_shared_key extension"
-		var pskExtIdx int = -1
-		// Save the outer extensions list BEFORE any PSK replacement, so we can use the correct
-		// extension types (with real PSK type 41) for encoding the inner hello
+		// For ECH + PSK (Chrome behavior):
+		// 1. Keep REAL PSK in outer ClientHello (server uses this directly)
+		// 2. Do NOT put PSK in inner ClientHello (keeps ECH payload small like Chrome)
+		// This deviates from ECH spec but matches Chrome's real-world behavior.
+		// See chrome_reference_data.md: Chrome's ECH payload is 240 bytes for both PSK and non-PSK.
+		// Save the outer extensions list for encoding the inner hello
 		var outerExtsList []uint16
 		if pskExt != nil && pskExt.cipherSuite != nil && len(pskExt.BinderKey) > 0 && len(pskExt.Identities) > 0 {
-			// Find the PSK extension index for later GREASE replacement
-			for i, ext := range uconn.Extensions {
-				if _, ok := ext.(*UtlsPreSharedKeyExtension); ok {
-					pskExtIdx = i
-					break
+			// Check for PROPER mode (default) vs FALLBACK mode
+			// PROPER mode: PSK in inner hello, ECH maintained
+			// FALLBACK mode: PSK in outer only, ECH bypassed (set UTLS_ECH_PSK_FALLBACK=1)
+			useFallbackModeInner := os.Getenv("UTLS_ECH_PSK_FALLBACK") != ""
+
+			if !useFallbackModeInner {
+				// PROPER MODE: Copy PSK to inner hello for true ECH+PSK
+				inner.pskIdentities = make([]pskIdentity, len(pskExt.Identities))
+				for i, id := range pskExt.Identities {
+					inner.pskIdentities[i] = pskIdentity{
+						label:               id.Label,
+						obfuscatedTicketAge: id.ObfuscatedTicketAge,
+					}
 				}
+				// Initialize binders with placeholder (correct size)
+				inner.pskBinders = make([][]byte, len(pskExt.Binders))
+				for i, b := range pskExt.Binders {
+					inner.pskBinders[i] = make([]byte, len(b))
+				}
+
+				// Recalculate PSK binder for inner hello transcript
+				// The binder must be computed over the inner hello, not the outer
+				if uconn.pskCipherSuite != nil && len(uconn.pskBinderKey) > 0 {
+					transcript := uconn.pskCipherSuite.hash.New()
+					helloBytes, err := inner.marshalWithoutBinders()
+					if err != nil {
+						return err
+					}
+					transcript.Write(helloBytes)
+					pskBinder := uconn.pskCipherSuite.finishedHash(uconn.pskBinderKey, transcript)
+					inner.pskBinders[0] = pskBinder
+				}
+
+				// Per ECH spec (draft-ietf-tls-esni), the outer PSK MUST use GREASE values
+				// when ECH is offered with PSK in inner. The outer hello should have
+				// random PSK identities and binders of the same lengths as the real ones.
+				for i := range pskExt.Identities {
+					// Generate random label with same length
+					randomLabel := make([]byte, len(pskExt.Identities[i].Label))
+					_, _ = io.ReadFull(uconn.config.rand(), randomLabel)
+					pskExt.Identities[i].Label = randomLabel
+					// Generate random obfuscated_ticket_age
+					var randomAge [4]byte
+					_, _ = io.ReadFull(uconn.config.rand(), randomAge[:])
+					pskExt.Identities[i].ObfuscatedTicketAge = uint32(randomAge[0])<<24 | uint32(randomAge[1])<<16 | uint32(randomAge[2])<<8 | uint32(randomAge[3])
+				}
+				for i := range pskExt.Binders {
+					// Generate random binder with same length
+					randomBinder := make([]byte, len(pskExt.Binders[i]))
+					_, _ = io.ReadFull(uconn.config.rand(), randomBinder)
+					pskExt.Binders[i] = randomBinder
+				}
+				// Prevent PatchBuiltHello from recalculating binders (would overwrite GREASE)
+				pskExt.SkipBinderPatching = true
 			}
+			// FALLBACK (Chrome-style): Do NOT put PSK in inner hello
 
-			// Copy PSK identities from the extension to inner hello
-			inner.pskIdentities = PskIdentities(pskExt.Identities).ToPrivate()
-
-			// Create placeholder binders of correct size
-			inner.pskBinders = make([][]byte, len(inner.pskIdentities))
-			for i := range inner.pskIdentities {
-				inner.pskBinders[i] = make([]byte, pskExt.cipherSuite.hash.Size())
-			}
-
-			// Marshal inner hello using EXPANDED format without binders to create transcript
-			// The server expands ech_outer_extensions and verifies the binder over that format
-			// We must use the same extension order as the outer hello
+			// Save outer extensions list for encoding inner hello
 			outerExtsList = uconn.extensionsList()
-			helloBytes, err := inner.marshalExpandedECHWithoutBinders(outerExtsList)
-			if err != nil {
-				return fmt.Errorf("failed to marshal inner hello for PSK binder: %w", err)
+
+			// In PROPER mode, EXCLUDE PSK (type 41) from ech_outer_extensions
+			// The PSK with inner binder must stay in inner hello, not be compressed
+			// Also ALWAYS exclude ECH (type 0xfe0d = 65037) - the inner hello has its own ECH marker
+			// (value 0x01 for inner), not the full ECH payload from outer
+			filtered := make([]uint16, 0, len(outerExtsList))
+			for _, ext := range outerExtsList {
+				// Filter out ECH (0xfe0d = 65037) - inner has its own marker
+				if ext == 65037 {
+					continue
+				}
+				// In PROPER mode (default), also filter out PSK (41)
+				if !useFallbackModeInner && ext == 41 {
+					continue
+				}
+				filtered = append(filtered, ext)
 			}
-
-			if os.Getenv("UTLS_ECH_DEBUG") != "" {
-				debugLen := len(helloBytes)
-				if debugLen > 100 {
-					debugLen = 100
-				}
-				fmt.Printf("[ECH DEBUG] Inner hello for PSK binder (len=%d): %x...\n", len(helloBytes), helloBytes[:debugLen])
-				fmt.Printf("[ECH DEBUG] Outer extension order: %v\n", outerExtsList)
-			}
-
-			// Calculate binder using inner hello's transcript (expanded format)
-			transcript := pskExt.cipherSuite.hash.New()
-			transcript.Write(helloBytes)
-			innerBinders := [][]byte{pskExt.cipherSuite.finishedHash(pskExt.BinderKey, transcript)}
-
-			if os.Getenv("UTLS_ECH_DEBUG") != "" {
-				fmt.Printf("[ECH DEBUG] Calculated PSK binder for inner: %x\n", innerBinders[0])
-			}
-
-			// Update inner hello's binders
-			inner.pskBinders = innerBinders
-
-			// Now create GREASE PSK for the outer hello
-			// GREASE PSK has random identities and binders of the same length as the real ones
-			if pskExtIdx >= 0 {
-				greasePskExt := &UtlsPreSharedKeyExtension{
-					PreSharedKeyCommon: PreSharedKeyCommon{
-						Identities: make([]PskIdentity, len(pskExt.Identities)),
-						Binders:    make([][]byte, len(pskExt.Binders)),
-					},
-				}
-
-				// Generate random PSK identities with same length
-				for i, realIdentity := range pskExt.Identities {
-					greasePskExt.Identities[i] = PskIdentity{
-						Label: make([]byte, len(realIdentity.Label)),
-					}
-					// Fill identity with random bytes
-					if _, err := io.ReadFull(rand.Reader, greasePskExt.Identities[i].Label); err != nil {
-						return fmt.Errorf("failed to generate GREASE PSK identity: %w", err)
-					}
-					// Generate random obfuscated ticket age
-					var ticketAge [4]byte
-					if _, err := io.ReadFull(rand.Reader, ticketAge[:]); err != nil {
-						return fmt.Errorf("failed to generate GREASE ticket age: %w", err)
-					}
-					greasePskExt.Identities[i].ObfuscatedTicketAge = uint32(ticketAge[0])<<24 | uint32(ticketAge[1])<<16 | uint32(ticketAge[2])<<8 | uint32(ticketAge[3])
-				}
-
-				// Generate random binders with same length
-				for i, realBinder := range pskExt.Binders {
-					greasePskExt.Binders[i] = make([]byte, len(realBinder))
-					if _, err := io.ReadFull(rand.Reader, greasePskExt.Binders[i]); err != nil {
-						return fmt.Errorf("failed to generate GREASE PSK binder: %w", err)
-					}
-				}
-
-				if os.Getenv("UTLS_ECH_DEBUG") != "" {
-					fmt.Printf("[ECH DEBUG] Replacing outer PSK with GREASE PSK (identities=%d, binders=%d)\n",
-						len(greasePskExt.Identities), len(greasePskExt.Binders))
-				}
-
-				// Replace the real PSK extension with GREASE in the extensions list
-				uconn.Extensions[pskExtIdx] = greasePskExt
-			}
+			outerExtsList = filtered
 		}
 
 		ech.innerHello = inner
-
-		// Debug: compare inner and outer random values
-		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("[ECH DEBUG] Inner random: %x\n", inner.random[:8])
-			fmt.Printf("[ECH DEBUG] Outer random: %x\n", uconn.HandshakeState.Hello.Random[:8])
-		}
 
 		// For ECH, the outer hello's SNI must be the ECH public name (from ECH config)
 		// Save the original SNI to restore after ECH computation if needed
 		originalServerName := uconn.config.ServerName
 		publicName := string(ech.config.PublicName)
 
-		// Debug: print SNI change
-		if os.Getenv("UTLS_ECH_DEBUG") != "" {
-			fmt.Printf("[ECH DEBUG] Updating outer SNI: %s -> %s\n", originalServerName, publicName)
-		}
-
 		// Update outer SNI extension to use the ECH public name
 		uconn.config.ServerName = publicName
-		sniFound := false
 		for _, ext := range uconn.Extensions {
 			if sniExt, ok := ext.(*SNIExtension); ok {
 				sniExt.ServerName = publicName
-				sniFound = true
-				if os.Getenv("UTLS_ECH_DEBUG") != "" {
-					fmt.Printf("[ECH DEBUG] Updated SNIExtension.ServerName to: %s\n", sniExt.ServerName)
-				}
 				break
 			}
-		}
-		if os.Getenv("UTLS_ECH_DEBUG") != "" && !sniFound {
-			fmt.Printf("[ECH DEBUG] WARNING: No SNIExtension found in Extensions!\n")
 		}
 
 		// Use the saved outerExtsList if available (computed before GREASE PSK replacement)
@@ -935,7 +889,7 @@ func (uconn *UConn) MarshalClientHello() error {
 		// instead of the GREASE PSK which has type 0 when reading from buffer
 		var echErr error
 		if outerExtsList != nil {
-			echErr = uconn.computeAndUpdateOuterECHExtensionWithOuterExts(inner, ech, true, outerExtsList)
+			echErr = uconn.computeAndUpdateOuterECHExtensionWithOuterExts(inner, ech, true, outerExtsList, pskExt)
 		} else {
 			echErr = uconn.computeAndUpdateOuterECHExtension(inner, ech, true)
 		}
