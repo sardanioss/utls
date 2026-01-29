@@ -1634,6 +1634,25 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 			}),
 		}, nil
 
+	// Chrome 144 - TLS fingerprint identical to Chrome 143 (same ja4/peetprint hash)
+	// Only HTTP headers (User-Agent, sec-ch-ua) differ between versions
+	case HelloChrome_144_Windows:
+		return utlsIdToSpec(HelloChrome_143_Windows)
+	case HelloChrome_144_Linux:
+		return utlsIdToSpec(HelloChrome_143_Linux)
+	case HelloChrome_144_macOS:
+		return utlsIdToSpec(HelloChrome_143_macOS)
+	case HelloChrome_144_QUIC:
+		return utlsIdToSpec(HelloChrome_143_QUIC)
+	case HelloChrome_144_Windows_PSK:
+		return utlsIdToSpec(HelloChrome_143_Windows_PSK)
+	case HelloChrome_144_Linux_PSK:
+		return utlsIdToSpec(HelloChrome_143_Linux_PSK)
+	case HelloChrome_144_macOS_PSK:
+		return utlsIdToSpec(HelloChrome_143_macOS_PSK)
+	case HelloChrome_144_QUIC_PSK:
+		return utlsIdToSpec(HelloChrome_143_QUIC_PSK)
+
 	case HelloFirefox_55, HelloFirefox_56:
 		return ClientHelloSpec{
 			TLSVersMax: VersionTLS12,
@@ -2786,6 +2805,203 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 				},
 			},
 		}, nil
+	case HelloSafari_18:
+		// Safari 18 with post-quantum X25519MLKEM768 support
+		// Captured from iOS/macOS Safari 18
+		// Note: Safari does NOT shuffle extensions (unlike Chrome)
+		return ClientHelloSpec{
+			TLSVersMin: VersionTLS12,
+			TLSVersMax: VersionTLS13,
+			CipherSuites: []uint16{
+				GREASE_PLACEHOLDER,
+				TLS_AES_256_GCM_SHA384,
+				TLS_CHACHA20_POLY1305_SHA256,
+				TLS_AES_128_GCM_SHA256,
+				TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+				TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+				TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+				TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+				TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+				TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+				TLS_RSA_WITH_AES_256_GCM_SHA384,
+				TLS_RSA_WITH_AES_128_GCM_SHA256,
+				TLS_RSA_WITH_AES_256_CBC_SHA,
+				TLS_RSA_WITH_AES_128_CBC_SHA,
+				FAKE_TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA,
+				TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
+				TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+			},
+			CompressionMethods: []uint8{
+				0x0, // no compression
+			},
+			Extensions: []TLSExtension{
+				&UtlsGREASEExtension{},
+				&SNIExtension{},
+				&ExtendedMasterSecretExtension{},
+				&RenegotiationInfoExtension{
+					Renegotiation: RenegotiateOnceAsClient,
+				},
+				&SupportedCurvesExtension{
+					Curves: []CurveID{
+						GREASE_PLACEHOLDER,
+						X25519MLKEM768,
+						X25519,
+						CurveP256,
+						CurveP384,
+						CurveP521,
+					},
+				},
+				&SupportedPointsExtension{
+					SupportedPoints: []uint8{
+						0x0, // uncompressed
+					},
+				},
+				&ALPNExtension{
+					AlpnProtocols: []string{
+						"h2",
+						"http/1.1",
+					},
+				},
+				&StatusRequestExtension{},
+				&SignatureAlgorithmsExtension{
+					SupportedSignatureAlgorithms: []SignatureScheme{
+						ECDSAWithP256AndSHA256,
+						PSSWithSHA256,
+						PKCS1WithSHA256,
+						ECDSAWithP384AndSHA384,
+						PSSWithSHA384,
+						PSSWithSHA384, // duplicate in real Safari
+						PKCS1WithSHA384,
+						PSSWithSHA512,
+						PKCS1WithSHA512,
+						PKCS1WithSHA1,
+					},
+				},
+				&SCTExtension{},
+				&KeyShareExtension{
+					KeyShares: []KeyShare{
+						{
+							Group: GREASE_PLACEHOLDER,
+							Data:  []byte{0},
+						},
+						{
+							Group: X25519MLKEM768,
+						},
+						{
+							Group: X25519,
+						},
+					},
+				},
+				&PSKKeyExchangeModesExtension{
+					Modes: []uint8{
+						PskModeDHE,
+					},
+				},
+				&SupportedVersionsExtension{
+					Versions: []uint16{
+						GREASE_PLACEHOLDER,
+						VersionTLS13,
+						VersionTLS12,
+					},
+				},
+				&UtlsCompressCertExtension{
+					Algorithms: []CertCompressionAlgo{
+						CertCompressionZlib,
+					},
+				},
+				&UtlsGREASEExtension{},
+				&UtlsPaddingExtension{
+					GetPaddingLen: BoringPaddingStyle,
+				},
+			},
+		}, nil
+	case HelloIOS_18:
+		// iOS 18 Safari - same TLS as Safari 18 (WebKit requirement)
+		// All iOS browsers use Safari's TLS stack
+		return UTLSIdToSpec(HelloSafari_18)
+
+	case HelloIOS_18_QUIC:
+		// iOS 18 Safari QUIC fingerprint - captured from real iOS Chrome 144
+		// iOS Chrome uses WebKit/Safari for H3 (Apple requirement)
+		// Key differences from Chrome QUIC:
+		// - Has GREASE extensions (multiple)
+		// - Has status_request (5) and SCT (18)
+		// - Uses zlib for compress_certificate (not brotli)
+		// - Different cipher order (GREASE, AES256, CHACHA, AES128)
+		// - NO application_settings (17613)
+		// - NO ECH (65037)
+		return ClientHelloSpec{
+			CipherSuites: []uint16{
+				GREASE_PLACEHOLDER,
+				TLS_AES_256_GCM_SHA384,
+				TLS_CHACHA20_POLY1305_SHA256,
+				TLS_AES_128_GCM_SHA256,
+			},
+			CompressionMethods: []byte{
+				0x00, // compressionNone
+			},
+			// Safari/iOS QUIC extension order - from real iOS Chrome 144 capture
+			Extensions: []TLSExtension{
+				&UtlsGREASEExtension{},
+				// server_name (0)
+				&SNIExtension{},
+				// supported_groups (10) - with GREASE
+				&SupportedCurvesExtension{[]CurveID{
+					GREASE_PLACEHOLDER,
+					X25519MLKEM768,
+					X25519,
+					CurveP256,
+					CurveP384,
+					CurveP521,
+				}},
+				// application_layer_protocol_negotiation (16)
+				&ALPNExtension{AlpnProtocols: []string{"h3"}},
+				// status_request (5) - Safari includes OCSP stapling
+				&StatusRequestExtension{},
+				// signature_algorithms (13) - real iOS has rsa_pss_rsae_sha384 duplicated
+				&SignatureAlgorithmsExtension{SupportedSignatureAlgorithms: []SignatureScheme{
+					ECDSAWithP256AndSHA256,
+					PSSWithSHA256,
+					PKCS1WithSHA256,
+					ECDSAWithP384AndSHA384,
+					PSSWithSHA384,
+					PSSWithSHA384, // Duplicate - real iOS Chrome sends this twice
+					PKCS1WithSHA384,
+					PSSWithSHA512,
+					PKCS1WithSHA512,
+					PKCS1WithSHA1,
+				}},
+				// signed_certificate_timestamp (18)
+				&SCTExtension{},
+				// key_share (51) - with GREASE
+				&KeyShareExtension{[]KeyShare{
+					{Group: GREASE_PLACEHOLDER, Data: []byte{0}},
+					{Group: X25519MLKEM768},
+					{Group: X25519},
+				}},
+				// psk_key_exchange_modes (45)
+				&PSKKeyExchangeModesExtension{[]uint8{
+					PskModeDHE,
+				}},
+				// supported_versions (43) - with GREASE
+				&SupportedVersionsExtension{[]uint16{
+					GREASE_PLACEHOLDER,
+					VersionTLS13,
+				}},
+				// quic_transport_parameters (57)
+				&QUICTransportParametersExtension{},
+				// compress_certificate (27) - Safari uses zlib, not brotli
+				&UtlsCompressCertExtension{[]CertCompressionAlgo{
+					CertCompressionZlib,
+				}},
+				&UtlsGREASEExtension{},
+			},
+		}, nil
+
 	case Hello360_7_5:
 		return ClientHelloSpec{
 			CipherSuites: []uint16{

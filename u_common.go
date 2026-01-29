@@ -667,11 +667,28 @@ var (
 	HelloChrome_143_macOS_PSK   = ClientHelloID{helloChrome, "143_macOS_PSK", nil, nil}
 	HelloChrome_143_QUIC_PSK    = ClientHelloID{helloChrome, "143_QUIC_PSK", nil, nil}
 
-	HelloIOS_Auto = HelloIOS_14
+	// Chrome 144 - TLS fingerprint identical to Chrome 143 (same ja4/peetprint hash)
+	// Only HTTP headers (User-Agent, sec-ch-ua) differ
+	HelloChrome_144_Windows = ClientHelloID{helloChrome, "144_Windows", nil, nil}
+	HelloChrome_144_Linux   = ClientHelloID{helloChrome, "144_Linux", nil, nil}
+	HelloChrome_144_macOS   = ClientHelloID{helloChrome, "144_macOS", nil, nil}
+
+	// Chrome 144 QUIC-specific preset for HTTP/3 connections
+	HelloChrome_144_QUIC = ClientHelloID{helloChrome, "144_QUIC", nil, nil}
+
+	// Chrome 144 PSK variants for session resumption
+	HelloChrome_144_Windows_PSK = ClientHelloID{helloChrome, "144_Windows_PSK", nil, nil}
+	HelloChrome_144_Linux_PSK   = ClientHelloID{helloChrome, "144_Linux_PSK", nil, nil}
+	HelloChrome_144_macOS_PSK   = ClientHelloID{helloChrome, "144_macOS_PSK", nil, nil}
+	HelloChrome_144_QUIC_PSK    = ClientHelloID{helloChrome, "144_QUIC_PSK", nil, nil}
+
+	HelloIOS_Auto = HelloIOS_18
 	HelloIOS_11_1 = ClientHelloID{helloIOS, "111", nil, nil} // legacy "111" means 11.1
 	HelloIOS_12_1 = ClientHelloID{helloIOS, "12.1", nil, nil}
 	HelloIOS_13   = ClientHelloID{helloIOS, "13", nil, nil}
 	HelloIOS_14   = ClientHelloID{helloIOS, "14", nil, nil}
+	HelloIOS_18   = ClientHelloID{helloIOS, "18", nil, nil}
+	HelloIOS_18_QUIC = ClientHelloID{helloIOS, "18_QUIC", nil, nil}
 
 	HelloAndroid_11_OkHttp = ClientHelloID{helloAndroid, "11", nil, nil}
 
@@ -679,8 +696,9 @@ var (
 	HelloEdge_85   = ClientHelloID{helloEdge, "85", nil, nil}
 	HelloEdge_106  = ClientHelloID{helloEdge, "106", nil, nil}
 
-	HelloSafari_Auto = HelloSafari_16_0
+	HelloSafari_Auto = HelloSafari_18
 	HelloSafari_16_0 = ClientHelloID{helloSafari, "16.0", nil, nil}
+	HelloSafari_18   = ClientHelloID{helloSafari, "18", nil, nil}
 
 	Hello360_Auto = Hello360_7_5 // Hello360_11_0 seems to be incompatible with this library
 	Hello360_7_5  = ClientHelloID{hello360, "7.5", nil, nil}
