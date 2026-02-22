@@ -1653,6 +1653,25 @@ func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
 	case HelloChrome_144_QUIC_PSK:
 		return utlsIdToSpec(HelloChrome_143_QUIC_PSK)
 
+	// Chrome 145 - TLS fingerprint identical to Chrome 144 (same ja4/peetprint hash)
+	// Only HTTP headers (User-Agent, sec-ch-ua) differ between versions
+	case HelloChrome_145_Windows:
+		return utlsIdToSpec(HelloChrome_144_Windows)
+	case HelloChrome_145_Linux:
+		return utlsIdToSpec(HelloChrome_144_Linux)
+	case HelloChrome_145_macOS:
+		return utlsIdToSpec(HelloChrome_144_macOS)
+	case HelloChrome_145_QUIC:
+		return utlsIdToSpec(HelloChrome_144_QUIC)
+	case HelloChrome_145_Windows_PSK:
+		return utlsIdToSpec(HelloChrome_144_Windows_PSK)
+	case HelloChrome_145_Linux_PSK:
+		return utlsIdToSpec(HelloChrome_144_Linux_PSK)
+	case HelloChrome_145_macOS_PSK:
+		return utlsIdToSpec(HelloChrome_144_macOS_PSK)
+	case HelloChrome_145_QUIC_PSK:
+		return utlsIdToSpec(HelloChrome_144_QUIC_PSK)
+
 	case HelloFirefox_55, HelloFirefox_56:
 		return ClientHelloSpec{
 			TLSVersMax: VersionTLS12,
