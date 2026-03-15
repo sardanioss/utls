@@ -697,6 +697,21 @@ var (
 	HelloChrome_145_macOS_PSK   = ClientHelloID{helloChrome, "145_macOS_PSK", nil, nil}
 	HelloChrome_145_QUIC_PSK    = ClientHelloID{helloChrome, "145_QUIC_PSK", nil, nil}
 
+	// Chrome 146 - TLS fingerprint identical to Chrome 145/144/143 (same ja4/peetprint hash)
+	// Only HTTP headers (User-Agent, sec-ch-ua) differ
+	HelloChrome_146_Windows = ClientHelloID{helloChrome, "146_Windows", nil, nil}
+	HelloChrome_146_Linux   = ClientHelloID{helloChrome, "146_Linux", nil, nil}
+	HelloChrome_146_macOS   = ClientHelloID{helloChrome, "146_macOS", nil, nil}
+
+	// Chrome 146 QUIC-specific preset for HTTP/3 connections
+	HelloChrome_146_QUIC = ClientHelloID{helloChrome, "146_QUIC", nil, nil}
+
+	// Chrome 146 PSK variants for session resumption
+	HelloChrome_146_Windows_PSK = ClientHelloID{helloChrome, "146_Windows_PSK", nil, nil}
+	HelloChrome_146_Linux_PSK   = ClientHelloID{helloChrome, "146_Linux_PSK", nil, nil}
+	HelloChrome_146_macOS_PSK   = ClientHelloID{helloChrome, "146_macOS_PSK", nil, nil}
+	HelloChrome_146_QUIC_PSK    = ClientHelloID{helloChrome, "146_QUIC_PSK", nil, nil}
+
 	HelloIOS_Auto = HelloIOS_18
 	HelloIOS_11_1 = ClientHelloID{helloIOS, "111", nil, nil} // legacy "111" means 11.1
 	HelloIOS_12_1 = ClientHelloID{helloIOS, "12.1", nil, nil}
