@@ -39,9 +39,12 @@ func UTLSIdToSpecWithSeed(id ClientHelloID, seed int64) (ClientHelloSpec, error)
 		return spec, err
 	}
 
-	// Apply seeded shuffle to extensions
-	// This works for both TCP and QUIC presets
-	spec.Extensions = ShuffleChromeTLSExtensionsWithSeed(spec.Extensions, seed)
+	// Only shuffle extensions for Chrome-based clients (Chrome shuffles since v110)
+	// Non-Chrome clients (Firefox, Safari, iOS, custom apps) have fixed extension order
+	switch id.Client {
+	case helloChrome:
+		spec.Extensions = ShuffleChromeTLSExtensionsWithSeed(spec.Extensions, seed)
+	}
 
 	return spec, nil
 }
