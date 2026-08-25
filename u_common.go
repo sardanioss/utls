@@ -39,6 +39,7 @@ const (
 	utlsExtensionApplicationSettings    uint16 = 17513  // not IANA assigned
 	utlsExtensionApplicationSettingsNew uint16 = 17613  // not IANA assigned
 	utlsFakeExtensionCustom             uint16 = 1234   // not IANA assigned, for ALPS
+	utlsExtensionTrustAnchors           uint16 = 0xca34 // draft-ietf-tls-trust-anchor-ids
 	utlsExtensionECH                    uint16 = 0xfe0d // draft-ietf-tls-esni-17
 	utlsExtensionECHOuterExtensions     uint16 = 0xfd00 // draft-ietf-tls-esni-17
 
@@ -712,12 +713,12 @@ var (
 	HelloChrome_146_macOS_PSK   = ClientHelloID{helloChrome, "146_macOS_PSK", nil, nil}
 	HelloChrome_146_QUIC_PSK    = ClientHelloID{helloChrome, "146_QUIC_PSK", nil, nil}
 
-	HelloIOS_Auto = HelloIOS_18
-	HelloIOS_11_1 = ClientHelloID{helloIOS, "111", nil, nil} // legacy "111" means 11.1
-	HelloIOS_12_1 = ClientHelloID{helloIOS, "12.1", nil, nil}
-	HelloIOS_13   = ClientHelloID{helloIOS, "13", nil, nil}
-	HelloIOS_14   = ClientHelloID{helloIOS, "14", nil, nil}
-	HelloIOS_18   = ClientHelloID{helloIOS, "18", nil, nil}
+	HelloIOS_Auto    = HelloIOS_18
+	HelloIOS_11_1    = ClientHelloID{helloIOS, "111", nil, nil} // legacy "111" means 11.1
+	HelloIOS_12_1    = ClientHelloID{helloIOS, "12.1", nil, nil}
+	HelloIOS_13      = ClientHelloID{helloIOS, "13", nil, nil}
+	HelloIOS_14      = ClientHelloID{helloIOS, "14", nil, nil}
+	HelloIOS_18      = ClientHelloID{helloIOS, "18", nil, nil}
 	HelloIOS_18_QUIC = ClientHelloID{helloIOS, "18_QUIC", nil, nil}
 
 	HelloAndroid_11_OkHttp = ClientHelloID{helloAndroid, "11", nil, nil}

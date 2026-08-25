@@ -73,6 +73,8 @@ func ExtensionFromID(id uint16) TLSExtension {
 		return &ApplicationSettingsExtension{}
 	case utlsExtensionApplicationSettingsNew:
 		return &ApplicationSettingsExtensionNew{}
+	case utlsExtensionTrustAnchors:
+		return &TrustAnchorsExtension{}
 	case fakeOldExtensionChannelID:
 		return &FakeChannelIDExtension{true}
 	case fakeExtensionChannelID:
