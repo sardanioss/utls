@@ -3795,7 +3795,7 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 		uconn.greaseSeed = p.GREASESeed
 	} else {
 		// Generate new random GREASE values
-		grease_bytes := make([]byte, 2*ssl_grease_last_index)
+		grease_bytes := make([]byte, 2*ssl_grease_seed_len)
 		_, err = io.ReadFull(uconn.config.rand(), grease_bytes)
 		if err != nil {
 			return errors.New("tls: short read from Rand: " + err.Error())
@@ -3861,6 +3861,32 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 			for i := range ext.Curves {
 				if isGREASEUint16(uint16(ext.Curves[i])) {
 					ext.Curves[i] = CurveID(GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_group))
+				}
+			}
+		case *SignatureAlgorithmsExtension:
+			// Chrome greases signature_algorithms from version 152.
+			// BoringSSL, ext_sigalgs_add_clienthello:
+			//
+			//	// Add a fake signature algorithm. See RFC 8701.
+			//	if (hs->ssl->ctx->grease_sigalgs_enabled &&
+			//	    !CBB_add_u16(&sigalgs_cbb,
+			//	                 ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
+			//	  return false;
+			//	}
+			//	if (!tls12_add_verify_sigalgs(hs, &sigalgs_cbb) || ...
+			//
+			// so the fake one is written BEFORE the real list, and where it
+			// sits is the preset's business. This only substitutes the real
+			// per-connection value wherever the preset left a placeholder,
+			// exactly as ciphers and curves are handled above.
+			//
+			// A captured hello re-parsed through Write lands here too: the
+			// captured value is itself a GREASE value, so it is replaced by
+			// this connection's own rather than replayed.
+			for i := range ext.SupportedSignatureAlgorithms {
+				if isGREASEUint16(uint16(ext.SupportedSignatureAlgorithms[i])) {
+					ext.SupportedSignatureAlgorithms[i] = SignatureScheme(
+						GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_signature_algorithm))
 				}
 			}
 		case *KeyShareExtension:

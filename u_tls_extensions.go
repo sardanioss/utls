@@ -470,7 +470,30 @@ func (e *SignatureAlgorithmsExtension) Write(b []byte) (int, error) {
 }
 
 func (e *SignatureAlgorithmsExtension) writeToUConn(uc *UConn) error {
-	uc.HandshakeState.Hello.SupportedSignatureAlgorithms = e.SupportedSignatureAlgorithms
+	// The GREASE entry goes on the wire, which Read handles, but it must not
+	// reach the Hello. BoringSSL advertises a fake signature algorithm and
+	// never selects it; letting Go's certificate logic see one as a candidate
+	// would be a bug, not a fingerprint.
+	//
+	// The common case has no GREASE, so only copy when there is one.
+	greased := false
+	for _, sa := range e.SupportedSignatureAlgorithms {
+		if isGREASEUint16(uint16(sa)) {
+			greased = true
+			break
+		}
+	}
+	if !greased {
+		uc.HandshakeState.Hello.SupportedSignatureAlgorithms = e.SupportedSignatureAlgorithms
+		return nil
+	}
+	real := make([]SignatureScheme, 0, len(e.SupportedSignatureAlgorithms))
+	for _, sa := range e.SupportedSignatureAlgorithms {
+		if !isGREASEUint16(uint16(sa)) {
+			real = append(real, sa)
+		}
+	}
+	uc.HandshakeState.Hello.SupportedSignatureAlgorithms = real
 	return nil
 }
 
@@ -964,7 +987,20 @@ const (
 	ssl_grease_extension2
 	ssl_grease_version
 	ssl_grease_ticket_extension
-	ssl_grease_last_index = ssl_grease_ticket_extension
+	ssl_grease_ech_config_id
+	ssl_grease_signature_algorithm
+	ssl_grease_last_index = ssl_grease_signature_algorithm
+
+	// ssl_grease_seed_len is the SIZE of the seed array. BoringSSL declares
+	// its own as
+	//
+	//	uint8_t grease_seed[ssl_grease_last_index + 1] = {0};
+	//
+	// and the plus one is not decoration: ssl_grease_last_index is an INDEX.
+	// Sizing the array by the index instead left the last slot off the end,
+	// so ssl_grease_ticket_extension was already unusable here before
+	// ssl_grease_ech_config_id and ssl_grease_signature_algorithm were added.
+	ssl_grease_seed_len = ssl_grease_last_index + 1
 )
 
 // it is responsibility of user not to generate multiple grease extensions with same value
@@ -977,8 +1013,8 @@ func (e *UtlsGREASEExtension) writeToUConn(uc *UConn) error {
 	return nil
 }
 
-// will panic if ssl_grease_last_index[index] is out of bounds.
-func GetBoringGREASEValue(greaseSeed [ssl_grease_last_index]uint16, index int) uint16 {
+// will panic if index is out of bounds.
+func GetBoringGREASEValue(greaseSeed [ssl_grease_seed_len]uint16, index int) uint16 {
 	// GREASE value is back from deterministic to random.
 	// https://github.com/google/boringssl/blob/a365138ac60f38b64bfc608b493e0f879845cb88/ssl/handshake_client.c#L530
 	ret := uint16(greaseSeed[index])

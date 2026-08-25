@@ -213,7 +213,7 @@ func (q *UQUICConn) SetTransportParameters(params []byte) {
 // GetGREASESeed returns the GREASE seed used by this connection.
 // This can be used to cache the seed and apply it to future connections
 // via ClientHelloSpec.GREASESeed for consistent TLS fingerprints.
-func (q *UQUICConn) GetGREASESeed() [ssl_grease_last_index]uint16 {
+func (q *UQUICConn) GetGREASESeed() [ssl_grease_seed_len]uint16 {
 	return q.conn.greaseSeed
 }
 

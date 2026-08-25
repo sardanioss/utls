@@ -40,7 +40,7 @@ type UConn struct {
 
 	HandshakeState PubClientHandshakeState
 
-	greaseSeed [ssl_grease_last_index]uint16
+	greaseSeed [ssl_grease_seed_len]uint16
 
 	omitSNIExtension bool
 
@@ -1087,7 +1087,7 @@ func (uconn *UConn) GetUnderlyingConn() net.Conn {
 // GetGREASESeed returns the GREASE seed used by this connection.
 // This can be used to cache the seed and apply it to future connections
 // via ClientHelloSpec.GREASESeed for consistent TLS fingerprints.
-func (uconn *UConn) GetGREASESeed() [ssl_grease_last_index]uint16 {
+func (uconn *UConn) GetGREASESeed() [ssl_grease_seed_len]uint16 {
 	return uconn.greaseSeed
 }
 
