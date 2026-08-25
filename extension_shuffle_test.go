@@ -2,6 +2,8 @@ package tls
 
 import (
 	"fmt"
+	"io"
+	"strings"
 	"testing"
 )
 
@@ -229,5 +231,89 @@ func TestCookieSpliceRange(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// extOrder is the extension type sequence a spec would put on the wire.
+func extOrder(t *testing.T, id ClientHelloID, seed int64) string {
+	t.Helper()
+	spec, err := UTLSIdToSpecWithSeed(id, seed)
+	if err != nil {
+		t.Fatalf("UTLSIdToSpecWithSeed(%+v): %v", id, err)
+	}
+	var b strings.Builder
+	for _, e := range spec.Extensions {
+		out := make([]byte, e.Len())
+		if _, err := e.Read(out); err != nil && err != io.EOF {
+			t.Fatalf("reading an extension: %v", err)
+		}
+		if len(out) >= 2 {
+			fmt.Fprintf(&b, "%d,", int(out[0])<<8|int(out[1]))
+		}
+	}
+	return b.String()
+}
+
+// Only Chromium clients permute their extensions.
+//
+// This asserts at the UTLSIdToSpecWithSeed level deliberately. The shuffle
+// tests above call ShuffleChromeTLSExtensionsWithSeed directly, so they pass
+// whatever that function is or is not applied to, and cannot catch a gate that
+// is too broad or too narrow.
+//
+// Measured against a real CriOS/151 capture, whose extension sequence
+// 0-23-65281-10-11-16-5-13-18-51-45-43-27 is this file's canonical Safari 18
+// order entry for entry, while two of our own connections produced two
+// different sequences.
+func TestOnlyChromiumPermutesExtensions(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		id      ClientHelloID
+		permute bool
+	}{
+		{"chrome", HelloChrome_133, true},
+		{"chrome 143", HelloChrome_143_Windows, true},
+		{"safari", HelloSafari_18, false},
+		{"ios", HelloIOS_18, false},
+		{"ios QUIC", HelloIOS_18_QUIC, false},
+		{"firefox", HelloFirefox_120, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Several seeds, because two orders can coincide by chance but six
+			// cannot.
+			seeds := []int64{1, 7, 99, 4242, 123456, 987654321}
+			orders := map[string]bool{}
+			for _, s := range seeds {
+				orders[extOrder(t, tc.id, s)] = true
+			}
+			if tc.permute {
+				if len(orders) < 4 {
+					t.Errorf("%d seeds produced only %d distinct extension orders; "+
+						"a Chromium client permutes, so nearly every seed should differ",
+						len(seeds), len(orders))
+				}
+				return
+			}
+			if len(orders) != 1 {
+				t.Errorf("%d seeds produced %d distinct extension orders; this "+
+					"client does not permute, so every connection must carry the "+
+					"same canonical sequence. A real capture of it has exactly one "+
+					"JA3 and ours would have 6.2e9", len(seeds), len(orders))
+			}
+		})
+	}
+}
+
+// And the canonical order a non-permuting client keeps is the one its parrot
+// declares, not some arbitrary fixed shuffle of it.
+//
+// The real CriOS/151 capture sent 0,23,65281,10,11,16,5,13,18,51,45,43,27
+// between its two GREASE extensions.
+func TestSafariKeepsItsCanonicalOrder(t *testing.T) {
+	got := extOrder(t, HelloIOS_18, 12345)
+	const want = "0,23,65281,10,11,16,5,13,18,51,45,43,27,"
+	if !strings.Contains(got, want) {
+		t.Errorf("iOS 18 extension order is\n  %s\nwant it to contain the captured\n  %s",
+			got, want)
 	}
 }

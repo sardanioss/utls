@@ -39,19 +39,77 @@ func UTLSIdToSpecWithSeed(id ClientHelloID, seed int64) (ClientHelloSpec, error)
 		return spec, err
 	}
 
-	// Apply seeded shuffle to extensions
-	// This works for both TCP and QUIC presets
+	// Apply the seeded shuffle, but ONLY to clients that really permute.
 	//
-	// This is the SECOND shuffle. utlsIdToSpec already shuffled the literal
-	// once with fresh randomness on the way out, and both are wanted. Delete
-	// the one in the literal and every connection built from this seed for the
-	// rest of the session carries a single fixed extension order, which turns
-	// a statistic needing thousands of samples into a per-connection constant
-	// that two connections expose. Delete this one and the caller loses the
-	// stability within a session that it asked for.
-	spec.Extensions = ShuffleChromeTLSExtensionsWithSeed(spec.Extensions, seed)
+	// This is the SECOND shuffle for a Chrome parrot: utlsIdToSpec already
+	// shuffled the literal with fresh randomness on the way out.
+	//
+	// The comment here used to say this one buys stability within a session.
+	// It does not, and cannot: the literal is shuffled with fresh randomness
+	// before the seed is ever applied, so shuffling that by a fixed seed still
+	// lands somewhere new. Measured, same seed twice, two different orders.
+	//
+	// That is fine, because per-connection is what the browser does. BoringSSL
+	// keeps the permutation on the handshake, not on the context:
+	//
+	//	// extension_permutation is the permutation to apply to ClientHello
+	//	// extensions. It maps indices into the `kExtensions` table into other
+	//	// indices.
+	//	Array<uint8_t> extension_permutation;   // in SSL_HANDSHAKE
+	//
+	//	bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
+	//
+	// so a Chrome profile draws a fresh order for every connection rather than
+	// once per launch. Do not "fix" this into a per-session constant.
+	//
+	// It used to run for EVERY ClientHelloID. Extension permutation is a
+	// Chromium behaviour: BoringSSL only shuffles when the caller sets
+	// SSL_set_permute_extensions, which Chrome does and Apple's stack has no
+	// equivalent of. Every literal that shuffles itself in this file is a
+	// Chrome parrot; no Safari, iOS or Firefox parrot does. So a Safari-family
+	// spec was being permuted here and nowhere else, which gave it a different
+	// JA3 on every session where the real browser has exactly one.
+	//
+	// Measured against a real CriOS/151 capture: the browser sent
+	//
+	//	0-23-65281-10-11-16-5-13-18-51-45-43-27
+	//
+	// which is this file's canonical Safari 18 order, entry for entry, while
+	// two of our own connections produced two different sequences. Thirteen
+	// movable extensions is 6.2e9 orders, so a JA3 allowlist never matches and
+	// two connections show the order moving with no statistics needed.
+	if permutesExtensions(id) {
+		spec.Extensions = ShuffleChromeTLSExtensionsWithSeed(spec.Extensions, seed)
+	}
 
 	return spec, nil
+}
+
+// permutesExtensions reports whether a client shuffles its ClientHello
+// extensions, which is a Chromium behaviour rather than a general one.
+//
+// Chromium-based clients permute. Everything else keeps the canonical order
+// its parrot declares. Anything unrecognised keeps permuting, because that is
+// the previous behaviour and silently pinning an order is the worse mistake of
+// the two: a pinned order that should move is invisible until someone captures
+// the real client, while a moving order that should be pinned at least matches
+// what this function did before.
+func permutesExtensions(id ClientHelloID) bool {
+	switch id.Client {
+	case helloChrome, helloEdge, hello360, helloQQ:
+		// Chromium, so BoringSSL with permutation enabled.
+		return true
+	case helloRandomized, helloRandomizedALPN, helloRandomizedNoALPN:
+		// Randomised by construction; pinning them would defeat the point.
+		return true
+	case helloFirefox, helloSafari, helloIOS, helloAndroid, helloGolang:
+		// NSS, Apple's stack, Conscrypt and Go respectively. None of them
+		// permutes: BoringSSL's shuffle is opt-in and only Chromium opts in,
+		// so Conscrypt does not either despite sharing the library.
+		return false
+	default:
+		return true
+	}
 }
 
 func utlsIdToSpec(id ClientHelloID) (ClientHelloSpec, error) {
