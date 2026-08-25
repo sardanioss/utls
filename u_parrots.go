@@ -3864,31 +3864,7 @@ func (uconn *UConn) ApplyPreset(p *ClientHelloSpec) error {
 				}
 			}
 		case *SignatureAlgorithmsExtension:
-			// Chrome greases signature_algorithms from version 152.
-			// BoringSSL, ext_sigalgs_add_clienthello:
-			//
-			//	// Add a fake signature algorithm. See RFC 8701.
-			//	if (hs->ssl->ctx->grease_sigalgs_enabled &&
-			//	    !CBB_add_u16(&sigalgs_cbb,
-			//	                 ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
-			//	  return false;
-			//	}
-			//	if (!tls12_add_verify_sigalgs(hs, &sigalgs_cbb) || ...
-			//
-			// so the fake one is written BEFORE the real list, and where it
-			// sits is the preset's business. This only substitutes the real
-			// per-connection value wherever the preset left a placeholder,
-			// exactly as ciphers and curves are handled above.
-			//
-			// A captured hello re-parsed through Write lands here too: the
-			// captured value is itself a GREASE value, so it is replaced by
-			// this connection's own rather than replayed.
-			for i := range ext.SupportedSignatureAlgorithms {
-				if isGREASEUint16(uint16(ext.SupportedSignatureAlgorithms[i])) {
-					ext.SupportedSignatureAlgorithms[i] = SignatureScheme(
-						GetBoringGREASEValue(uconn.greaseSeed, ssl_grease_signature_algorithm))
-				}
-			}
+			regreaseSignatureAlgorithms(ext, uconn.greaseSeed)
 		case *KeyShareExtension:
 			preferredCurveIsSet := false
 			for i := range ext.KeyShares {
@@ -4301,4 +4277,50 @@ func cookieSpliceRange(exts []TLSExtension) (lo, hi int) {
 		return 1, 1
 	}
 	return first, last + 1
+}
+
+// regreaseSignatureAlgorithms replaces every GREASE placeholder in a
+// signature_algorithms extension with this connection's own value.
+//
+// Chrome greases signature_algorithms from version 152.
+// BoringSSL, ext_sigalgs_add_clienthello:
+//
+//	// Add a fake signature algorithm. See RFC 8701.
+//	if (hs->ssl->ctx->grease_sigalgs_enabled &&
+//	    !CBB_add_u16(&sigalgs_cbb,
+//	                 ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
+//	  return false;
+//	}
+//	if (!tls12_add_verify_sigalgs(hs, &sigalgs_cbb) || ...
+//
+// so the fake one is written BEFORE the real list, and where it sits is the
+// preset's business. Substituting in place matches how ciphers and curves are
+// handled, so the preset decides the position.
+//
+// A captured hello re-parsed through Write lands here too: the captured value
+// is itself a GREASE value, so it is replaced by this connection's own rather
+// than replayed.
+func regreaseSignatureAlgorithms(ext *SignatureAlgorithmsExtension, seed [ssl_grease_seed_len]uint16) {
+	for i := range ext.SupportedSignatureAlgorithms {
+		if isGREASEUint16(uint16(ext.SupportedSignatureAlgorithms[i])) {
+			ext.SupportedSignatureAlgorithms[i] = SignatureScheme(
+				GetBoringGREASEValue(seed, ssl_grease_signature_algorithm))
+		}
+	}
+}
+
+// RegreaseSignatureAlgorithms re-runs that substitution over the extensions a
+// connection is holding, using its own seed.
+//
+// It exists for callers that build a hello from a ClientHelloID and then edit
+// uconn.Extensions afterwards, which happens after ApplyPreset has already
+// regreased and so misses any placeholder introduced by the edit. Without it
+// such a caller emits the literal 0x0a0a placeholder on every connection: a
+// constant where the browser draws one of sixteen.
+func (uconn *UConn) RegreaseSignatureAlgorithms() {
+	for _, ext := range uconn.Extensions {
+		if sa, ok := ext.(*SignatureAlgorithmsExtension); ok {
+			regreaseSignatureAlgorithms(sa, uconn.greaseSeed)
+		}
+	}
 }
