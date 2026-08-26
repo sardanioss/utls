@@ -4366,19 +4366,3 @@ func regreaseSignatureAlgorithms(ext *SignatureAlgorithmsExtension, seed [ssl_gr
 		}
 	}
 }
-
-// RegreaseSignatureAlgorithms re-runs that substitution over the extensions a
-// connection is holding, using its own seed.
-//
-// It exists for callers that build a hello from a ClientHelloID and then edit
-// uconn.Extensions afterwards, which happens after ApplyPreset has already
-// regreased and so misses any placeholder introduced by the edit. Without it
-// such a caller emits the literal 0x0a0a placeholder on every connection: a
-// constant where the browser draws one of sixteen.
-func (uconn *UConn) RegreaseSignatureAlgorithms() {
-	for _, ext := range uconn.Extensions {
-		if sa, ok := ext.(*SignatureAlgorithmsExtension); ok {
-			regreaseSignatureAlgorithms(sa, uconn.greaseSeed)
-		}
-	}
-}
