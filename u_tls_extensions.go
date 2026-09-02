@@ -1372,9 +1372,23 @@ func (e *KeyShareExtension) UnmarshalJSON(b []byte) error {
 
 // QUICTransportParametersExtension implements quic_transport_parameters (57).
 //
-// Currently, it works as a fake extension and does not support parsing, since
-// the QUICConn provided by this package does not really understand these
-// parameters.
+// The parameters themselves are opaque here: this package's QUICConn does not
+// interpret them, and a QUIC stack layered on top supplies the real ones for the
+// connection being made. Parsing is still supported, and matters, because it is
+// what lets a captured QUIC ClientHello be read without blunt mimicry.
+//
+// That distinction is the whole point. Blunt mimicry is a blanket instruction to
+// pass every unrecognised extension through unchecked, and extension 57 was the
+// only thing in a QUIC hello that forced it, so one unmodelled extension turned
+// off validation for all the others. With Write implemented, a QUIC capture
+// parses like any other hello and every remaining extension is modelled and
+// checked, with an unknown one an error rather than silent pass-through.
+//
+// The captured bytes are retained as the faithful record of what was seen. They
+// are not what goes on the wire for a real QUIC connection: transport parameters
+// carry connection-specific values such as initial_source_connection_id, so
+// replaying another connection's would be wrong and the QUIC layer replaces this
+// extension with its own before the handshake.
 type QUICTransportParametersExtension struct {
 	TransportParameters TransportParameters
 
@@ -1423,6 +1437,24 @@ func (e *QUICTransportParametersExtension) Read(b []byte) (int, error) {
 func (e *QUICTransportParametersExtension) writeToUConn(*UConn) error {
 	// no need to set *UConn.quic.transportParams, since it is unused
 	return nil
+}
+
+// Write fills the extension from a captured quic_transport_parameters body,
+// making this a TLSExtensionWriter so a QUIC ClientHello can be parsed without
+// blunt mimicry.
+//
+// The body is stored verbatim rather than decoded into TransportParameters. A
+// round trip through a parameter model is not guaranteed to be byte-identical:
+// the encoding is a sequence of varint-tagged values whose order and integer
+// widths are the sender's choice, so re-marshalling can produce a different
+// byte string for the same meaning. Keeping the bytes makes Read reproduce
+// exactly what was captured, which is the only representation worth having for
+// a fingerprint.
+func (e *QUICTransportParametersExtension) Write(b []byte) (int, error) {
+	e.RawData = make([]byte, len(b))
+	copy(e.RawData, b)
+	e.marshalResult = nil
+	return len(b), nil
 }
 
 // PSKKeyExchangeModesExtension implements psk_key_exchange_modes (45).
