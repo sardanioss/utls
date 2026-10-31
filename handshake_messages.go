@@ -2019,6 +2019,7 @@ func (m *certificateMsg) unmarshal(data []byte) bool {
 }
 
 type certificateMsgTLS13 struct {
+	original     []byte // [uTLS]
 	certificate  Certificate
 	ocspStapling bool
 	scts         bool
@@ -2080,8 +2081,16 @@ func marshalCertificate(b *cryptobyte.Builder, certificate Certificate) {
 	})
 }
 
+// [uTLS] The client holds the server's Certificate back from the transcript until it
+// knows the message was not compressed, then writes it through transcriptMsg. Marshal
+// cannot rebuild it: it writes a leaf's OCSP staple before its SCTs and drops every other
+// extension, so the transcript must take the bytes as the server sent them.
+func (m *certificateMsgTLS13) originalBytes() []byte {
+	return m.original
+}
+
 func (m *certificateMsgTLS13) unmarshal(data []byte) bool {
-	*m = certificateMsgTLS13{}
+	*m = certificateMsgTLS13{original: data} // [uTLS]
 	s := cryptobyte.String(data)
 
 	var context cryptobyte.String
